@@ -1,4 +1,4 @@
-# Web Video Beauty · 网页视频美颜（Chromium MV3）
+# 实时美颜（Chromium MV3）
 
 > 本机离线实时网页视频美颜浏览器扩展 —— **WebGL 单 Pass 美肤/微整形 + MediaPipe 478 点离主线程人脸追踪**，无需服务器、不上传任何视频帧，零后台常驻开销。
 
@@ -44,7 +44,7 @@ flowchart LR
 ## 快速安装
 
 ### 方式一：直接下载 Release 预构建包（推荐普通用户）
-1. 前往本仓库 **Releases** 页面下载 `web-video-beauty-mv3-v1.0.0.zip` 并解压。
+1. 前往本仓库 **Releases** 页面下载 `realtime-beauty-v1.0.0.zip` 并解压。
 2. 打开浏览器扩展管理页：
    - Chrome：`chrome://extensions`
    - Edge：`edge://extensions`
@@ -56,8 +56,8 @@ flowchart LR
 > 需要 Node.js >= 18（零 npm 第三方运行时依赖）。
 
 ```bash
-git clone https://github.com/<your-username>/web-video-beauty-mv3.git
-cd web-video-beauty-mv3
+git clone https://github.com/<your-username>/realtime-beauty.git
+cd realtime-beauty
 
 # 1. 下载官方离线 MediaPipe WASM 与 478 点人脸模型到 vendor/mediapipe/
 npm run setup
@@ -88,7 +88,7 @@ npm run build
 ## 目录结构
 
 ```text
-web-video-beauty-mv3/
+realtime-beauty/
 ├── manifest.json             # MV3 清单（最小权限 + icons + wasm-unsafe-eval）
 ├── icons/                    # 16 / 48 / 128 扩展图标
 ├── popup/                    # Wink 风格 10 项分项调参面板、预设、JSON 导入导出与诊断

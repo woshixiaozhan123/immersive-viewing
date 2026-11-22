@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Web Video Beauty · 网页视频美颜",
+  "name": "实时美颜",
   "version": "1.0.0",
   "description": "本机离线实时网页视频美颜扩展（MV3 + WebGL + MediaPipe 478 点人脸追踪），支持 Wink 风格分项美肤、轻度微整形、风格预设与 JSON 导入导出。",
   "icons": {
@@ -14,7 +14,7 @@
     "storage"
   ],
   "action": {
-    "default_title": "网页视频美颜",
+    "default_title": "实时美颜",
     "default_popup": "popup/popup.html",
     "default_icon": {
       "16": "icons/icon16.png",

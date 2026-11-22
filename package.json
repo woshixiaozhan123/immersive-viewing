@@ -1,9 +1,9 @@
 {
-  "name": "web-video-beauty-mv3",
+  "name": "realtime-beauty",
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Local real-time HTML5 web video beauty Chromium MV3 extension powered by WebGL + MediaPipe Face Landmarker Worker.",
+  "description": "实时美颜 — 本机离线实时网页视频美颜 Chromium MV3 扩展（WebGL + MediaPipe 478 点人脸追踪）。",
   "license": "MIT",
   "engines": {
     "node": ">=18.0.0"

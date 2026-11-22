@@ -1,4 +1,4 @@
-# Contributing to Web Video Beauty
+# 参与贡献 · 实时美颜
 
 欢迎提交 Issue 和 Pull Request！
 

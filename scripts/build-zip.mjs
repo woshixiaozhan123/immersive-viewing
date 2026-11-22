@@ -19,7 +19,7 @@ execFileSync(process.execPath, [path.join(__dirname, "check.mjs"), "--require-mo
 const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, "manifest.json"), "utf8"));
 const distDir = path.join(ROOT, "dist");
 fs.mkdirSync(distDir, { recursive: true });
-const outZip = path.join(distDir, `web-video-beauty-mv3-v${manifest.version}.zip`);
+const outZip = path.join(distDir, `realtime-beauty-v${manifest.version}.zip`);
 
 const INCLUDE_PATHS = [
   "manifest.json",
