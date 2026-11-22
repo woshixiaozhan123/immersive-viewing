@@ -1,0 +1,17 @@
+# Build artifacts
+dist/
+*.zip
+*.crx
+*.pem
+
+# Dependencies & OS files
+node_modules/
+.DS_Store
+Thumbs.db
+*.log
+
+# Heavy MediaPipe binaries (fetched cleanly via `npm run setup` or bundled in GitHub Releases)
+vendor/mediapipe/vision_bundle.mjs
+vendor/mediapipe/face_landmarker.task
+vendor/mediapipe/wasm/
+!vendor/mediapipe/.gitkeep

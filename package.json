@@ -1,0 +1,16 @@
+{
+  "name": "web-video-beauty-mv3",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local real-time HTML5 web video beauty Chromium MV3 extension powered by WebGL + MediaPipe Face Landmarker Worker.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "setup": "node scripts/fetch-mediapipe.mjs",
+    "check": "node scripts/check.mjs",
+    "build": "node scripts/build-zip.mjs"
+  }
+}

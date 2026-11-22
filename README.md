@@ -1,0 +1,116 @@
+# Web Video Beauty · 网页视频美颜（Chromium MV3）
+
+> 本机离线实时网页视频美颜浏览器扩展 —— **WebGL 单 Pass 美肤/微整形 + MediaPipe 478 点离主线程人脸追踪**，无需服务器、不上传任何视频帧，零后台常驻开销。
+
+[![Manifest V3](https://img.shields.io/badge/Manifest-V3-38bdf8?style=flat-square)](#)
+[![WebGL + MediaPipe](https://img.shields.io/badge/Engine-WebGL%20%2B%20MediaPipe%20478-ec4899?style=flat-square)](#)
+[![License: MIT](https://img.shields.io/badge/License-MIT-10b981?style=flat-square)](LICENSE)
+
+---
+
+## 核心特性
+
+- **100% 本机离线推理与渲染**：所有视频帧与人脸关键点均在用户浏览器本地处理，零远端 API、零数据上报。
+- **最小权限 & 按需注入**：仅申请 `activeTab`、`scripting`、`storage`，无常驻后台 Service Worker；未点击扩展图标时不注入任何页面代码。
+- **Wink 风格 10 项分项美颜**：
+  - **美肤画质（7 项）**：磨皮（12-tap 保边双边近似）、美白（高光保护冷白提亮）、红润（苹果肌区域暖色提气色）、清晰锐化（眼唇细节保边增强）、去黑眼圈、亮眼、自然润唇。
+  - **面部微调（3 项）**：瘦脸（颧骨 + 下颌线）、大眼、瘦鼻；内置纵横比校正与侧脸对称度 `yawFactor` 自动衰减，避免侧脸背景拉扯。
+  - **预设与导入导出**：内置 5 档风格预设（自然清透 / 冷白质感 / 日系柔光 / 纯欲微调 / 归零）、本地「我的方案」保存、参数 JSON 复制/文件导入导出（同时兼容中英文字段与 `0–100` / `0–1` 数值），双击滑块可单项归零。
+- **双频解耦 & 丝滑防抖**：
+  - 渲染主循环跟随视频帧（`requestVideoFrameCallback`，自动回退 `requestAnimationFrame`）；
+  - 人脸追踪运行在独立 Module Web Worker（CPU XNNPACK / WASM SIMD，把 GPU 留给渲染与视频硬解），配合主脸 IoU 锁定、One-Euro 滤波与 ≤120ms 速度外推。
+- **主流播放器通用适配 & 保护边界尊重**：
+  - 自动适配 **XGPlayer（抖音等）**、**Plyr**、**Bilibili**、**YouTube** 与通用 HTML5 `<video>`（含开放 Shadow DOM 与同源 `iframe`）；
+  - 精准支持 `object-fit: contain` / `cover` / `fill` 叠层对齐、悬停小预览降权、上下刷视频切条自动跟随、失焦暂停静态调参、容器全屏保持与原生 `<video>` 全屏自动回退；
+  - 严格区分 **保护信号**（检测到 EME `mediaKeys` / `encrypted` 事件立即跳过取帧并保持原画）与 **取帧结果**（`可取帧 / 等待画面 / 跨域受限 / EME 已跳过 / 失败未确认`）；
+  - **L0–L3 自动性能降级** 与 `webglcontextlost` 恢复，关闭美颜或离页时完整释放 Worker 与 WebGL 上下文。
+
+---
+
+## 架构概览
+
+```mermaid
+flowchart LR
+  V["HTML5 &lt;video&gt;"] -->|rVFC / rAF 30fps| GL["WebGL 单 Pass 渲染<br/>UV微整形 + 12-tap磨皮 + 多通道遮罩"]
+  V -->|下采样 288-384px<br/>10-18fps 零拷贝 ImageBitmap| W["Web Worker (CPU XNNPACK)<br/>MediaPipe Face Landmarker 478点"]
+  W -->|主脸 IoU 锁定 + One-Euro 平滑| M["384×384 RGBA 语义遮罩<br/>R=肤区 G=眼部 B=唇部 + 面部锚点"]
+  M --> GL
+  GL --> O["非侵入 Canvas 叠层<br/>pointer-events: none"]
+  P["MV3 Popup 面板"] <-->|chrome.tabs / runtime| GL
+```
+
+---
+
+## 快速安装
+
+### 方式一：直接下载 Release 预构建包（推荐普通用户）
+1. 前往本仓库 **Releases** 页面下载 `web-video-beauty-mv3-v1.0.0.zip` 并解压。
+2. 打开浏览器扩展管理页：
+   - Chrome：`chrome://extensions`
+   - Edge：`edge://extensions`
+   - ego(lite)：`ego://extensions`
+3. 开启右上角 **开发者模式** → 点击 **加载已解压/未打包的扩展程序** → 选择解压后的文件夹（包含 `manifest.json` 的目录）。
+4. 打开任意 HTML5 视频页，点击工具栏扩展图标即可查看诊断并开启实时美颜。
+
+### 方式二：从源码克隆构建（开发者）
+> 需要 Node.js >= 18（零 npm 第三方运行时依赖）。
+
+```bash
+git clone https://github.com/<your-username>/web-video-beauty-mv3.git
+cd web-video-beauty-mv3
+
+# 1. 下载官方离线 MediaPipe WASM 与 478 点人脸模型到 vendor/mediapipe/
+npm run setup
+
+# 2. 校验语法、manifest 与资源完整性
+npm run check
+
+# 3. 打包可直接分发/提审的干净 zip 到 dist/
+npm run build
+```
+
+> 若跳过 `npm run setup` 直接加载源码，扩展依然可以正常运行，并自动进入 **「WebGL 肤色保边回退模式」**（磨皮 / 美白 / 红润 / 清晰锐化立即可用）。
+
+---
+
+## 浏览器兼容性与实测表现
+
+在开启硬件加速的 Windows 桌面端通过可控测试页与主流视频站实测：
+
+| 浏览器 | 状态 | 离线 478 点人脸遮罩 | 典型渲染耗时 (P95) |
+| :--- | :--- | :--- | :--- |
+| **Google Chrome** | ✅ 已验证 | 支持（CPU XNNPACK） | ~3.0–3.3 ms（L0） |
+| **Microsoft Edge** | ✅ 已验证 | 支持（CPU XNNPACK） | ~3.0 ms（L0） |
+| **ego(lite)** | ✅ 已验证 | 支持（CPU XNNPACK） | ~2.9–3.0 ms（L0） |
+
+---
+
+## 目录结构
+
+```text
+web-video-beauty-mv3/
+├── manifest.json             # MV3 清单（最小权限 + icons + wasm-unsafe-eval）
+├── icons/                    # 16 / 48 / 128 扩展图标
+├── popup/                    # Wink 风格 10 项分项调参面板、预设、JSON 导入导出与诊断
+├── content/engine.js         # 主引擎：选源、多播放器适配、EME/CORS探针、WebGL管线、L0-L3降级
+├── worker/face-worker.js     # 离主线程 MediaPipe 478 点推理、主脸锁定与 One-Euro 滤波
+├── vendor/mediapipe/         # 离线 MediaPipe 模型与 ES Module WASM（npm run setup 拉取）
+├── test-page/index.html      # 可控边界测试页（双人脸、同源iframe、cover/contain、全屏、EME）
+├── scripts/                  # setup / check / build 零依赖 Node 脚本
+└── .github/workflows/ci.yml  # GitHub Actions 自动校验与打包工作流
+```
+
+---
+
+## 已知边界与限制
+
+- **受 DRM (EME) 保护的流媒体**：遵循浏览器安全与版权机制，检测到 `mediaKeys` 或 `encrypted` 事件后主动跳过取帧并保持原画播放。
+- **无 CORS 头的跨域直链视频**：浏览器 `texImage2D` 会按规范抛出 `SecurityError`，诊断面板将明确标记为「跨域受限」并保持原画（MSE `blob:` 流与同源流不受此限制）。
+- **跨域 `iframe` 与自绘 `<canvas>` 播放器**：当前在诊断面板标记为待适配提示。
+- **严格 CSP 网站**：若目标站点 CSP 禁止 `blob:` Worker，引擎会自动平滑降级至「肤色保边回退模式」，不中断播放。
+
+---
+
+## 开源协议与致谢
+
+本项目采用 [MIT License](LICENSE) 开源；第三方模型与组件许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。欢迎通过 [CONTRIBUTING.md](CONTRIBUTING.md) 参与贡献。

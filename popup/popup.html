@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>网页视频美颜</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <div>
+        <h1>网页视频美颜</h1>
+        <p class="subtitle">Wink 分项调参 · WebGL + 478 点本机追踪</p>
+      </div>
+      <label class="switch" title="开启或关闭美颜">
+        <input type="checkbox" id="toggleBeauty" />
+        <span class="slider"></span>
+      </label>
+    </header>
+
+    <section class="card">
+      <div class="row-between">
+        <span class="label">当前视频</span>
+        <button id="btnRescan" class="link-btn" type="button">重新扫描</button>
+      </div>
+      <select id="videoSelect" class="select"></select>
+      <div id="videoMeta" class="meta">正在检测当前标签页视频…</div>
+      <div class="badges">
+        <span id="badgeProtection" class="badge neutral">保护：检测中</span>
+        <span id="badgeCapture" class="badge neutral">取帧：等待中</span>
+        <span id="badgeMode" class="badge neutral">模式：待就绪</span>
+      </div>
+    </section>
+
+    <section class="card beauty-panel">
+      <div class="row-between">
+        <span class="label">风格预设</span>
+        <span id="activePresetLabel" class="hint-muted">自定义</span>
+      </div>
+      <div class="preset-bar" id="presetBar">
+        <button class="pill" data-preset="natural" type="button">自然清透</button>
+        <button class="pill" data-preset="cool_fair" type="button">冷白质感</button>
+        <button class="pill" data-preset="soft_glow" type="button">日系柔光</button>
+        <button class="pill" data-preset="delicate" type="button">纯欲微调</button>
+        <button class="pill ghost-pill" data-preset="reset" type="button">归零</button>
+      </div>
+
+      <div class="tabs" role="tablist">
+        <button class="tab active" data-tab="skin" type="button" role="tab">美肤画质</button>
+        <button class="tab" data-tab="reshape" type="button" role="tab">面部微调</button>
+        <button class="tab" data-tab="io" type="button" role="tab">导入 / 导出</button>
+      </div>
+
+      <div class="tab-pane" id="pane-skin">
+        <div class="slider-list" id="skinSliders"></div>
+      </div>
+
+      <div class="tab-pane hidden" id="pane-reshape">
+        <p class="tip-box">微整形依赖 478 点人脸遮罩；侧脸角度过大或 L2 降级时自动平滑减弱，避免边缘拉扯。</p>
+        <div class="slider-list" id="reshapeSliders"></div>
+      </div>
+
+      <div class="tab-pane hidden" id="pane-io">
+        <div class="io-row">
+          <button id="btnSaveCustom" class="btn ghost small" type="button">存为「我的方案」</button>
+          <button id="btnLoadCustom" class="btn ghost small" type="button">加载「我的方案」</button>
+        </div>
+        <div class="io-row">
+          <button id="btnExportClip" class="btn ghost small" type="button">复制参数 JSON</button>
+          <button id="btnExportFile" class="btn ghost small" type="button">下载 .json</button>
+          <label class="btn ghost small file-label">
+            选择 .json
+            <input id="inputImportFile" type="file" accept=".json,application/json" hidden />
+          </label>
+        </div>
+        <textarea
+          id="presetJsonInput"
+          class="json-box"
+          rows="4"
+          placeholder='粘贴参数 JSON（支持 0-100 或 0-1，也支持中文字段），例如：&#10;{"磨皮": 50, "美白": 35, "红润": 20, "锐化": 30, "瘦脸": 20, "大眼": 15}'
+        ></textarea>
+        <div class="row-between">
+          <button id="btnApplyJson" class="btn secondary small" type="button">导入并应用 JSON</button>
+          <span id="ioStatus" class="hint"></span>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button id="btnCompare" class="btn secondary" type="button">按住看原画</button>
+        <button id="btnRetry" class="btn ghost" type="button">重新检测</button>
+      </div>
+    </section>
+
+    <details class="card diag" id="diagDetails">
+      <summary>诊断信息与性能监控</summary>
+      <div class="diag-grid" id="diagGrid"></div>
+      <div class="diag-actions">
+        <button id="btnCopyDiag" class="btn ghost small" type="button">复制诊断 JSON</button>
+        <span id="copyHint" class="hint"></span>
+      </div>
+    </details>
+
+    <div id="errorBanner" class="error-banner hidden"></div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

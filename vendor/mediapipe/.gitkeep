@@ -1,0 +1,1 @@
+# Keep vendor/mediapipe directory tracked; run `npm run setup` to download official offline MediaPipe assets.

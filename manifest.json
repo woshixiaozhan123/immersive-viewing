@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "Web Video Beauty · 网页视频美颜",
+  "version": "1.0.0",
+  "description": "本机离线实时网页视频美颜扩展（MV3 + WebGL + MediaPipe 478 点人脸追踪），支持 Wink 风格分项美肤、轻度微整形、风格预设与 JSON 导入导出。",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage"
+  ],
+  "action": {
+    "default_title": "网页视频美颜",
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "worker/face-worker.js",
+        "vendor/mediapipe/*",
+        "vendor/mediapipe/wasm/*"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>网页视频美颜扩展 · 可控测试页</title>
+  <style>
+    body { margin: 0; padding: 24px; background: #0f172a; color: #e2e8f0; font-family: system-ui, sans-serif; }
+    .wrap { max-width: 960px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    button, label.file-btn {
+      background: #1e293b; color: #f8fafc; border: 1px solid #334155;
+      border-radius: 8px; padding: 8px 12px; cursor: pointer; font-size: 13px;
+    }
+    button:hover, label.file-btn:hover { background: #334155; }
+    .plyr { position: relative; background: #000; border-radius: 10px; overflow: hidden; }
+    .plyr__video-wrapper { position: relative; width: 100%; aspect-ratio: 16 / 9; background: #000; }
+    .plyr__video-wrapper video { width: 100%; height: 100%; object-fit: contain; display: block; }
+    .plyr__controls {
+      position: absolute; left: 0; right: 0; bottom: 0; z-index: 3;
+      background: linear-gradient(transparent, rgba(0,0,0,0.75));
+      padding: 12px 16px; display: flex; gap: 10px; align-items: center;
+    }
+    .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+    .mini { background: #1e293b; padding: 10px; border-radius: 8px; }
+    .mini video, .mini iframe { width: 240px; height: 135px; background: #000; display: block; border: none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h2>可控测试页（模拟 Plyr / HTML5 播放器容器与边界场景）</h2>
+    <div class="toolbar">
+      <label class="file-btn">选择本地 MP4/WebM 测试视频
+        <input id="fileInput" type="file" accept="video/*" hidden />
+      </label>
+      <button id="btnContainerFs">容器全屏（应保持美颜）</button>
+      <button id="btnNativeFs">原生 &lt;video&gt; 全屏（应回退原画）</button>
+      <button id="btnBlurPause">模拟失焦自动暂停：关</button>
+      <button id="btnReplaceVideo">模拟切集（重建 video）</button>
+      <button id="btnDualFace">双人脸同框模拟：关</button>
+      <button id="btnObjectFit">object-fit：contain</button>
+      <button id="btnSimEme">模拟 EME encrypted 事件</button>
+    </div>
+
+    <div class="plyr" id="plyrContainer">
+      <div class="plyr__video-wrapper" id="videoWrapper">
+        <video id="mainVideo" controls playsinline loop></video>
+      </div>
+      <div class="plyr__controls">
+        <button id="btnPlayPause">播放 / 暂停</button>
+        <span id="statusText" style="font-size:12px;color:#cbd5e1;">请加载本地视频，或使用下方自动生成的测试画面流</span>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="mini">
+        <p style="margin:0 0 8px;font-size:12px;color:#94a3b8;">干扰测试：小尺寸静音悬停预览视频（应被自动选源降权）</p>
+        <video id="previewVideo" muted loop playsinline></video>
+      </div>
+      <div class="mini">
+        <p style="margin:0 0 8px;font-size:12px;color:#94a3b8;">同源 iframe 测试：可被扩展识别并手动切换</p>
+        <iframe
+          id="sameOriginFrame"
+          title="同源 iframe 视频测试"
+          srcdoc="<!DOCTYPE html><html><body style='margin:0;background:#000;overflow:hidden;'><video id='iframeVideo' controls muted loop playsinline style='width:100%;height:100vh;object-fit:contain;display:block;'></video></body></html>"
+        ></iframe>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const getMainVideo = () => document.querySelector("#videoWrapper video");
+    const previewVideo = document.getElementById("previewVideo");
+    const sameOriginFrame = document.getElementById("sameOriginFrame");
+    const fileInput = document.getElementById("fileInput");
+    const plyrContainer = document.getElementById("plyrContainer");
+    const btnBlurPause = document.getElementById("btnBlurPause");
+    const btnDualFace = document.getElementById("btnDualFace");
+    const statusText = document.getElementById("statusText");
+    let blurPauseEnabled = false;
+    let dualFaceEnabled = false;
+
+    function drawFace(ctx, cx, cy, scale) {
+      ctx.fillStyle = "#e0ac8b";
+      ctx.beginPath();
+      ctx.ellipse(cx, cy, 140 * scale, 185 * scale, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "#c98f6d";
+      for (let i = 0; i < 40; i++) {
+        ctx.fillRect(
+          cx - 80 * scale + (((i * 37) % 160) * scale),
+          cy - 100 * scale + (((i * 53) % 200) * scale),
+          6 * scale,
+          4 * scale
+        );
+      }
+      // Eyes & lips
+      ctx.fillStyle = "#1f2937";
+      ctx.beginPath(); ctx.arc(cx - 48 * scale, cy - 35 * scale, 14 * scale, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx + 48 * scale, cy - 35 * scale, 14 * scale, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#b91c1c";
+      ctx.beginPath(); ctx.ellipse(cx, cy + 62 * scale, 36 * scale, 14 * scale, 0, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // Generate a synthetic skin-tone + texture MediaStream so users can test immediately without an MP4
+    function createSyntheticStream() {
+      const c = document.createElement("canvas");
+      c.width = 1280;
+      c.height = 720;
+      const ctx = c.getContext("2d");
+      let t = 0;
+      function draw() {
+        t += 0.03;
+        ctx.fillStyle = "#1e293b";
+        ctx.fillRect(0, 0, c.width, c.height);
+        const primaryCx = (dualFaceEnabled ? 460 : 640) + Math.sin(t) * 75;
+        const primaryCy = 360 + Math.cos(t * 0.7) * 30;
+        drawFace(ctx, primaryCx, primaryCy, 1.0);
+        if (dualFaceEnabled) {
+          const secondCx = 900 + Math.cos(t * 1.1) * 55;
+          const secondCy = 370 + Math.sin(t * 0.9) * 28;
+          drawFace(ctx, secondCx, secondCy, 0.76);
+        }
+        requestAnimationFrame(draw);
+      }
+      draw();
+      return c.captureStream(30);
+    }
+
+    const stream = createSyntheticStream();
+    const initialMain = getMainVideo();
+    initialMain.srcObject = stream;
+    previewVideo.srcObject = stream;
+    initialMain.play().catch(() => {});
+    previewVideo.play().catch(() => {});
+
+    const bindIframeVideo = () => {
+      try {
+        const iv = sameOriginFrame.contentDocument && sameOriginFrame.contentDocument.getElementById("iframeVideo");
+        if (iv) {
+          iv.srcObject = stream;
+          iv.play().catch(() => {});
+        }
+      } catch (_) {}
+    };
+    sameOriginFrame.addEventListener("load", bindIframeVideo);
+    bindIframeVideo();
+
+    fileInput.addEventListener("change", () => {
+      const f = fileInput.files[0];
+      if (!f) return;
+      const v = getMainVideo();
+      v.srcObject = null;
+      v.src = URL.createObjectURL(f);
+      v.play();
+      statusText.textContent = `已加载本地视频：${f.name}`;
+    });
+
+    document.getElementById("btnPlayPause").addEventListener("click", () => {
+      const v = getMainVideo();
+      if (v.paused) v.play();
+      else v.pause();
+    });
+
+    document.getElementById("btnContainerFs").addEventListener("click", () => {
+      plyrContainer.requestFullscreen();
+    });
+
+    document.getElementById("btnNativeFs").addEventListener("click", () => {
+      getMainVideo().requestFullscreen();
+    });
+
+    btnBlurPause.addEventListener("click", () => {
+      blurPauseEnabled = !blurPauseEnabled;
+      btnBlurPause.textContent = `模拟失焦自动暂停：${blurPauseEnabled ? "开" : "关"}`;
+    });
+
+    btnDualFace.addEventListener("click", () => {
+      dualFaceEnabled = !dualFaceEnabled;
+      btnDualFace.textContent = `双人脸同框模拟：${dualFaceEnabled ? "开" : "关"}`;
+    });
+
+    document.getElementById("btnObjectFit").addEventListener("click", (e) => {
+      const v = getMainVideo();
+      const nextFit = v.style.objectFit === "cover" ? "contain" : "cover";
+      v.style.objectFit = nextFit;
+      e.target.textContent = `object-fit：${nextFit}`;
+      window.dispatchEvent(new Event("resize"));
+    });
+
+    document.getElementById("btnSimEme").addEventListener("click", () => {
+      const v = getMainVideo();
+      v.dispatchEvent(new Event("encrypted"));
+      statusText.textContent = "已派发模拟 EME encrypted 事件（扩展应跳过取帧并保持原画）";
+    });
+
+    window.addEventListener("blur", () => {
+      const v = getMainVideo();
+      if (blurPauseEnabled && v && !v.paused) v.pause();
+    });
+
+    document.getElementById("btnReplaceVideo").addEventListener("click", () => {
+      const wrap = document.getElementById("videoWrapper");
+      const old = wrap.querySelector("video");
+      const next = document.createElement("video");
+      next.id = "mainVideo";
+      next.controls = true;
+      next.playsInline = true;
+      next.loop = true;
+      next.srcObject = stream;
+      wrap.replaceChild(next, old);
+      next.play().catch(() => {});
+      statusText.textContent = "已重建 <video> 节点模拟切集";
+    });
+  </script>
+</body>
+</html>
