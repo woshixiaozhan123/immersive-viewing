@@ -11,7 +11,7 @@
     <header class="header">
       <div>
         <h1>实时美颜</h1>
-        <p class="subtitle">Wink 分项调参 · WebGL + 478 点本机追踪</p>
+        <p class="subtitle">26 项 Wink/剪映专业调参 · WebGL + 478 点本机追踪</p>
       </div>
       <label class="switch" title="开启或关闭美颜">
         <input type="checkbox" id="toggleBeauty" />
@@ -43,13 +43,16 @@
         <button class="pill" data-preset="cool_fair" type="button">冷白质感</button>
         <button class="pill" data-preset="soft_glow" type="button">日系柔光</button>
         <button class="pill" data-preset="delicate" type="button">纯欲微调</button>
+        <button class="pill" data-preset="glam" type="button">网感精修</button>
         <button class="pill ghost-pill" data-preset="reset" type="button">归零</button>
       </div>
 
       <div class="tabs" role="tablist">
-        <button class="tab active" data-tab="skin" type="button" role="tab">美肤画质</button>
-        <button class="tab" data-tab="reshape" type="button" role="tab">面部微调</button>
-        <button class="tab" data-tab="io" type="button" role="tab">导入 / 导出</button>
+        <button class="tab active" data-tab="skin" type="button" role="tab">美肤</button>
+        <button class="tab" data-tab="reshape" type="button" role="tab">美型</button>
+        <button class="tab" data-tab="makeup" type="button" role="tab">美妆</button>
+        <button class="tab" data-tab="color" type="button" role="tab">调色</button>
+        <button class="tab" data-tab="io" type="button" role="tab">方案</button>
       </div>
 
       <div class="tab-pane" id="pane-skin">
@@ -57,8 +60,38 @@
       </div>
 
       <div class="tab-pane hidden" id="pane-reshape">
-        <p class="tip-box">微整形依赖 478 点人脸遮罩；侧脸角度过大或 L2 降级时自动平滑减弱，避免边缘拉扯。</p>
+        <p class="tip-box">美型依赖 478 点人脸锚点；侧脸角度过大或 L2 降级时自动平滑减弱，双击单项可归零。</p>
         <div class="slider-list" id="reshapeSliders"></div>
+      </div>
+
+      <div class="tab-pane hidden" id="pane-makeup">
+        <div class="slider-list" id="makeupSliders"></div>
+        <div class="swatch-row" id="lipShadeRow">
+          <span class="slider-name" title="选择口红唇色风格">唇色风格</span>
+          <div class="swatch-list" id="lipShadeList">
+            <button class="swatch" data-shade="0" type="button" title="裸粉">
+              <span class="swatch-dot" style="background:#eb8f9e"></span>
+              <span>裸粉</span>
+            </button>
+            <button class="swatch" data-shade="1" type="button" title="蜜桃橘">
+              <span class="swatch-dot" style="background:#f27a5c"></span>
+              <span>蜜桃橘</span>
+            </button>
+            <button class="swatch" data-shade="2" type="button" title="玫瑰豆沙">
+              <span class="swatch-dot" style="background:#e0526b"></span>
+              <span>豆沙</span>
+            </button>
+            <button class="swatch" data-shade="3" type="button" title="复古正红">
+              <span class="swatch-dot" style="background:#d1293d"></span>
+              <span>正红</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div class="tab-pane hidden" id="pane-color">
+        <p class="tip-box">画面调色直接作用于整帧视频（含无脸或降级回退场景），双向滑块支持 -50 到 +50 精调。</p>
+        <div class="slider-list" id="colorSliders"></div>
       </div>
 
       <div class="tab-pane hidden" id="pane-io">
@@ -78,7 +111,7 @@
           id="presetJsonInput"
           class="json-box"
           rows="4"
-          placeholder='粘贴参数 JSON（支持 0-100 或 0-1，也支持中文字段），例如：&#10;{"磨皮": 50, "美白": 35, "红润": 20, "锐化": 30, "瘦脸": 20, "大眼": 15}'
+          placeholder='粘贴参数 JSON（支持 0-100 / -50~+50 / 归一化浮点，支持全部 26 项中英文字段），例如：&#10;{"磨皮": 55, "淡法令纹": 30, "窄颧骨": 20, "立体修容": 25, "色温": -12}'
         ></textarea>
         <div class="row-between">
           <button id="btnApplyJson" class="btn secondary small" type="button">导入并应用 JSON</button>

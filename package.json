@@ -1,6 +1,6 @@
 {
   "name": "realtime-beauty",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "实时美颜 — 本机离线实时网页视频美颜 Chromium MV3 扩展（WebGL + MediaPipe 478 点人脸追踪）。",

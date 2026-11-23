@@ -1,22 +1,67 @@
 (() => {
   if (window.__WVB_ENGINE__) return;
 
+  const BIPOLAR_KEYS = new Set([
+    "vChin",
+    "eyeTilt",
+    "mouthSize",
+    "exposure",
+    "contrast",
+    "saturation",
+    "temperature",
+  ]);
+
+  // 4 Wink-style lip color shades: 0=裸粉, 1=蜜桃橘, 2=玫瑰豆沙, 3=复古正红
+  const LIP_SHADE_RGB = [
+    [0.92, 0.56, 0.62],
+    [0.95, 0.48, 0.36],
+    [0.88, 0.32, 0.42],
+    [0.82, 0.16, 0.24],
+  ];
+
   const DEFAULT_BEAUTY_PARAMS = {
+    // 美肤 (7)
     smooth: 0.45,
+    skinTexture: 0.30,
     whiten: 0.30,
     rosy: 0.15,
-    sharpen: 0.25,
     underEye: 0.25,
-    brightEye: 0.20,
-    lipTint: 0.15,
+    nasolabial: 0.20,
+    matte: 0.15,
+    // 美型 (8)
     slimFace: 0.20,
+    slimCheekbone: 0.12,
+    vChin: 0.0,
     bigEyes: 0.15,
+    eyeTilt: 0.0,
     slimNose: 0.12,
+    mouthSize: 0.0,
+    mouthSmile: 0.10,
+    // 美妆 (5)
+    brightEye: 0.20,
+    contour: 0.15,
+    lipTint: 0.18,
+    lipShade: 2,
+    whitenTeeth: 0.20,
+    // 调色 (6)
+    sharpen: 0.25,
+    exposure: 0.0,
+    contrast: 0.0,
+    saturation: 0.0,
+    temperature: 0.0,
+    softGlow: 0.0,
   };
 
-  function clamp01(val, fallback) {
+  function clampParam(key, val, fallback) {
     const n = Number(val);
     if (!Number.isFinite(n)) return fallback;
+    if (key === "lipShade") {
+      return Math.max(0, Math.min(LIP_SHADE_RGB.length - 1, Math.round(n)));
+    }
+    if (BIPOLAR_KEYS.has(key)) {
+      const norm = Math.abs(n) > 1 ? n / 50 : n;
+      return Math.max(-1, Math.min(1, norm));
+    }
     const norm = n > 1 ? n / 100 : n;
     return Math.max(0, Math.min(1, norm));
   }
@@ -26,7 +71,7 @@
     if (!input || typeof input !== "object") return out;
     for (const key of Object.keys(DEFAULT_BEAUTY_PARAMS)) {
       if (input[key] !== undefined) {
-        out[key] = clamp01(input[key], out[key]);
+        out[key] = clampParam(key, input[key], out[key]);
       }
     }
     return out;
@@ -55,30 +100,36 @@
     }
   `;
 
-  // Wink-style real-time WebGL beauty pipeline:
-  // UV micro-reshape (slimFace/bigEyes/slimNose) + 12-tap edge-preserving skin smooth +
-  // whiten + rosy cheeks + under-eye brighten + bright eyes + lip tint + clarity sharpen.
+  // Wink / CapCut Pro single-pass WebGL pipeline (26 parameters):
+  // 1) UV micro-reshape (slimFace, slimCheekbone, vChin, bigEyes, eyeTilt, slimNose, mouthSize, mouthSmile)
+  // 2) Skin (smooth, skinTexture, whiten, rosy, underEye, nasolabial, matte)
+  // 3) Makeup (brightEye, contour, lipTint + lipShade, whitenTeeth)
+  // 4) Color grading (sharpen, exposure, contrast, saturation, temperature, softGlow)
   const FRAG_SRC = `
     precision mediump float;
     uniform sampler2D u_video;
     uniform sampler2D u_mask;
     uniform vec2 u_texel;
-    uniform float u_fade;
     uniform float u_hasFaceMask;
     uniform float u_compareOriginal;
-    uniform float u_liteMode;
 
-    // u_skinParams:    (smooth, whiten, rosy, sharpen)
-    // u_detailParams:  (underEye, brightEye, lipTint, yawFactor)
-    // u_reshapeParams: (slimFace, bigEyes, slimNose, aspect)
-    uniform vec4 u_skinParams;
-    uniform vec4 u_detailParams;
-    uniform vec4 u_reshapeParams;
+    // Parameter vectors
+    uniform vec4 u_skinA;     // (smooth, skinTexture, whiten, rosy)
+    uniform vec4 u_skinB;     // (underEye, nasolabial, matte, yawFactor)
+    uniform vec4 u_reshapeA;  // (slimFace, slimCheekbone, vChin, bigEyes)
+    uniform vec4 u_reshapeB;  // (eyeTilt, slimNose, mouthSize, mouthSmile)
+    uniform vec4 u_makeupA;   // (brightEye, contour, lipTint, whitenTeeth)
+    uniform vec4 u_lipColor;  // (lipR, lipG, lipB, aspect)
+    uniform vec4 u_colorA;    // (sharpen, exposure, contrast, saturation)
+    uniform vec4 u_colorB;    // (temperature, softGlow, fade, liteMode)
 
-    // Extrapolated face landmark anchors in normalized UV space
+    // Face landmark anchor vectors (normalized UV space)
     uniform vec4 u_eyes;          // (leftEyeX, leftEyeY, rightEyeX, rightEyeY)
+    uniform vec4 u_eyeOuter;      // (leftOuterX, leftOuterY, rightOuterX, rightOuterY)
     uniform vec4 u_eyeRadii;      // (leftEyeR, rightEyeR, faceWidth, faceHeight)
-    uniform vec4 u_noseChin;      // (noseTipX, noseTipY, chinX, chinY)
+    uniform vec4 u_noseBridge;    // (bridgeTopX, bridgeTopY, noseTipX, noseTipY)
+    uniform vec4 u_chinMouth;     // (chinX, chinY, mouthCenterX, mouthCenterY)
+    uniform vec4 u_mouthCorners;  // (leftCornerX, leftCornerY, rightCornerX, rightCornerY)
     uniform vec4 u_leftContour;   // (leftCheekX, leftCheekY, leftJawX, leftJawY)
     uniform vec4 u_rightContour;  // (rightCheekX, rightCheekY, rightJawX, rightJawY)
     uniform vec4 u_noseWings;     // (leftWingX, leftWingY, rightWingX, rightWingY)
@@ -111,6 +162,18 @@
       return uv;
     }
 
+    float segMask(vec2 uv, vec2 a, vec2 b, float width, float aspect) {
+      if (width <= 0.0005) return 0.0;
+      vec2 pa = uv - a;
+      vec2 ba = b - a;
+      pa.x *= aspect;
+      ba.x *= aspect;
+      float denom = max(dot(ba, ba), 1e-5);
+      float h = clamp(dot(pa, ba) / denom, 0.0, 1.0);
+      float dist = length(pa - ba * h);
+      return 1.0 - smoothstep(width * 0.25, width, dist);
+    }
+
     float underEyeMask(vec2 uv, vec2 eyeCenter, float eyeR, float aspect) {
       if (eyeR <= 0.001) return 0.0;
       vec2 c = eyeCenter + vec2(0.0, eyeR * 0.78);
@@ -131,13 +194,12 @@
       return wCb * wCr * wLuma;
     }
 
-    vec3 edgePreservingSmooth(vec2 uv, vec3 center, float smoothStrength, float radiusScale) {
+    vec3 edgePreservingSmooth(vec2 uv, vec3 center, float smoothStrength, float textureKeep, float radiusScale, float liteMode) {
       float centerLuma = dot(center, vec3(0.299, 0.587, 0.114));
-      float sigmaRange = 0.11 + 0.095 * smoothStrength;
+      float sigmaRange = mix(0.13 + 0.10 * smoothStrength, 0.075 + 0.055 * smoothStrength, textureKeep);
       vec3 acc = center * 0.8;
       float wSum = 0.8;
 
-      // 12-tap ring (6 inner + 6 outer); L2 lite mode skips outer ring
       vec2 offsets[12];
       offsets[0]  = vec2( 1.0,  0.0);
       offsets[1]  = vec2(-1.0,  0.0);
@@ -153,7 +215,7 @@
       offsets[11] = vec2( 0.0, -2.6);
 
       for (int i = 0; i < 12; i++) {
-        if (u_liteMode > 0.5 && i >= 6) break;
+        if (liteMode > 0.5 && i >= 6) break;
         vec2 sampleUv = clamp(uv + offsets[i] * u_texel * radiusScale, vec2(0.0), vec2(1.0));
         vec3 s = texture2D(u_video, sampleUv).rgb;
         float diff = dot(s, vec3(0.299, 0.587, 0.114)) - centerLuma;
@@ -166,59 +228,123 @@
     }
 
     void main() {
-      if (u_compareOriginal > 0.5 || u_fade <= 0.001) {
+      if (u_compareOriginal > 0.5) {
         gl_FragColor = texture2D(u_video, v_uv);
         return;
       }
 
-      float smoothAmt   = u_skinParams.x;
-      float whitenAmt   = u_skinParams.y;
-      float rosyAmt     = u_skinParams.z;
-      float sharpenAmt  = u_skinParams.w;
+      float smoothAmt     = u_skinA.x;
+      float skinTexAmt    = u_skinA.y;
+      float whitenAmt     = u_skinA.z;
+      float rosyAmt       = u_skinA.w;
 
-      float underEyeAmt  = u_detailParams.x;
-      float brightEyeAmt = u_detailParams.y;
-      float lipTintAmt   = u_detailParams.z;
-      float yawFactor    = u_detailParams.w;
+      float underEyeAmt   = u_skinB.x;
+      float nasolabialAmt = u_skinB.y;
+      float matteAmt      = u_skinB.z;
+      float yawFactor     = u_skinB.w;
 
-      float slimFaceAmt = u_reshapeParams.x;
-      float bigEyesAmt  = u_reshapeParams.y;
-      float slimNoseAmt = u_reshapeParams.z;
-      float aspect      = max(u_reshapeParams.w, 0.1);
+      float slimFaceAmt   = u_reshapeA.x;
+      float slimCheekAmt  = u_reshapeA.y;
+      float vChinAmt      = u_reshapeA.z;
+      float bigEyesAmt    = u_reshapeA.w;
 
-      float totalDrive =
-        smoothAmt + whitenAmt + rosyAmt + sharpenAmt +
-        underEyeAmt + brightEyeAmt + lipTintAmt +
-        slimFaceAmt + bigEyesAmt + slimNoseAmt;
-      if (totalDrive <= 0.001) {
+      float eyeTiltAmt    = u_reshapeB.x;
+      float slimNoseAmt   = u_reshapeB.y;
+      float mouthSizeAmt  = u_reshapeB.z;
+      float mouthSmileAmt = u_reshapeB.w;
+
+      float brightEyeAmt  = u_makeupA.x;
+      float contourAmt    = u_makeupA.y;
+      float lipTintAmt    = u_makeupA.z;
+      float teethAmt      = u_makeupA.w;
+
+      vec3 lipShadeRgb    = u_lipColor.xyz;
+      float aspect        = max(u_lipColor.w, 0.1);
+
+      float sharpenAmt    = u_colorA.x;
+      float exposureAmt   = u_colorA.y;
+      float contrastAmt   = u_colorA.z;
+      float satAmt        = u_colorA.w;
+
+      float tempAmt       = u_colorB.x;
+      float softGlowAmt   = u_colorB.y;
+      float faceFade      = u_colorB.z;
+      float liteMode      = u_colorB.w;
+
+      float anyColor =
+        sharpenAmt + abs(exposureAmt) + abs(contrastAmt) + abs(satAmt) + abs(tempAmt) + softGlowAmt;
+      float anyFace =
+        smoothAmt + whitenAmt + rosyAmt + underEyeAmt + nasolabialAmt + matteAmt +
+        slimFaceAmt + slimCheekAmt + abs(vChinAmt) + bigEyesAmt + abs(eyeTiltAmt) +
+        slimNoseAmt + abs(mouthSizeAmt) + mouthSmileAmt +
+        brightEyeAmt + contourAmt + lipTintAmt + teethAmt;
+
+      if (anyColor <= 0.001 && (anyFace <= 0.001 || faceFade <= 0.001)) {
         gl_FragColor = texture2D(u_video, v_uv);
         return;
       }
 
-      // 1) Aspect-corrected micro-reshape UV warp (gated by face mask, yaw symmetry, and L2 mode)
+      // 1) Aspect-corrected micro-reshape UV warp (gated by face mask, yaw symmetry, fade & L2)
       vec2 wuv = v_uv;
-      if (u_hasFaceMask > 0.5 && u_liteMode < 0.5 && yawFactor > 0.01) {
-        float wFade = u_fade * yawFactor;
+      float anyReshape =
+        slimFaceAmt + slimCheekAmt + abs(vChinAmt) + bigEyesAmt +
+        abs(eyeTiltAmt) + slimNoseAmt + abs(mouthSizeAmt) + mouthSmileAmt;
+      if (u_hasFaceMask > 0.5 && liteMode < 0.5 && faceFade > 0.001 && yawFactor > 0.01 && anyReshape > 0.001) {
+        float wFade = faceFade * yawFactor;
+        float fw = max(u_eyeRadii.z, 0.02);
+        float fh = max(u_eyeRadii.w, 0.02);
+        vec2 noseTip = u_noseBridge.zw;
+        vec2 chinPt  = u_chinMouth.xy;
+        vec2 faceUp  = normalize((u_noseBridge.xy - noseTip) + vec2(0.0, -1e-4));
+
         if (bigEyesAmt > 0.001) {
           float be = bigEyesAmt * wFade;
           wuv = warpEye(wuv, u_eyes.xy, u_eyeRadii.x, be, aspect);
           wuv = warpEye(wuv, u_eyes.zw, u_eyeRadii.y, be, aspect);
         }
-        if (slimFaceAmt > 0.001 && u_eyeRadii.z > 0.01) {
-          float sf = slimFaceAmt * wFade;
-          float rCheek = max(u_eyeRadii.z * 0.46, 0.02);
-          float rJaw   = max(u_eyeRadii.z * 0.50, 0.02);
-          vec2 jawTarget = mix(u_noseChin.xy, u_noseChin.zw, 0.55);
-          wuv = warpPush(wuv, u_leftContour.xy,  u_noseChin.xy, rCheek, sf * 0.22, aspect);
-          wuv = warpPush(wuv, u_rightContour.xy, u_noseChin.xy, rCheek, sf * 0.22, aspect);
-          wuv = warpPush(wuv, u_leftContour.zw,  jawTarget,     rJaw,   sf * 0.28, aspect);
-          wuv = warpPush(wuv, u_rightContour.zw, jawTarget,     rJaw,   sf * 0.28, aspect);
+        if (abs(eyeTiltAmt) > 0.001) {
+          float et = eyeTiltAmt * wFade;
+          vec2 shiftL = faceUp * (u_eyeRadii.x * 0.28 * et);
+          vec2 shiftR = faceUp * (u_eyeRadii.y * 0.28 * et);
+          wuv = warpPush(wuv, u_eyeOuter.xy, u_eyeOuter.xy + shiftL, max(u_eyeRadii.x * 0.85, 0.015), 0.9, aspect);
+          wuv = warpPush(wuv, u_eyeOuter.zw, u_eyeOuter.zw + shiftR, max(u_eyeRadii.y * 0.85, 0.015), 0.9, aspect);
         }
-        if (slimNoseAmt > 0.001 && u_eyeRadii.z > 0.01) {
+        // Independent cheekbone & lower jaw slimming (with smooth continuity)
+        float effCheek = clamp(slimCheekAmt + slimFaceAmt * 0.22, 0.0, 1.0);
+        if (effCheek > 0.001) {
+          float sc = effCheek * wFade;
+          float rCheek = max(fw * 0.44, 0.02);
+          wuv = warpPush(wuv, u_leftContour.xy,  noseTip, rCheek, sc * 0.24, aspect);
+          wuv = warpPush(wuv, u_rightContour.xy, noseTip, rCheek, sc * 0.24, aspect);
+        }
+        if (slimFaceAmt > 0.001) {
+          float sf = slimFaceAmt * wFade;
+          float rJaw = max(fw * 0.48, 0.02);
+          vec2 jawTarget = mix(noseTip, chinPt, 0.55);
+          wuv = warpPush(wuv, u_leftContour.zw,  jawTarget, rJaw, sf * 0.28, aspect);
+          wuv = warpPush(wuv, u_rightContour.zw, jawTarget, rJaw, sf * 0.28, aspect);
+        }
+        if (abs(vChinAmt) > 0.001) {
+          float vc = vChinAmt * wFade;
+          vec2 downDir = -faceUp;
+          vec2 chinTarget = chinPt + downDir * (fh * 0.075 * vc);
+          wuv = warpPush(wuv, chinPt, chinTarget, max(fw * 0.36, 0.02), 0.85, aspect);
+        }
+        if (slimNoseAmt > 0.001) {
           float sn = slimNoseAmt * wFade;
-          float rNose = max(u_eyeRadii.z * 0.19, 0.015);
-          wuv = warpPush(wuv, u_noseWings.xy, u_noseChin.xy, rNose, sn * 0.34, aspect);
-          wuv = warpPush(wuv, u_noseWings.zw, u_noseChin.xy, rNose, sn * 0.34, aspect);
+          float rNose = max(fw * 0.19, 0.015);
+          wuv = warpPush(wuv, u_noseWings.xy, noseTip, rNose, sn * 0.34, aspect);
+          wuv = warpPush(wuv, u_noseWings.zw, noseTip, rNose, sn * 0.34, aspect);
+        }
+        if (abs(mouthSizeAmt) > 0.001) {
+          wuv = warpEye(wuv, u_chinMouth.zw, max(fw * 0.24, 0.02), mouthSizeAmt * 0.65 * wFade, aspect);
+        }
+        if (mouthSmileAmt > 0.001) {
+          float ms = mouthSmileAmt * wFade;
+          vec2 lift = faceUp * (fh * 0.042 * ms);
+          float rMouth = max(fw * 0.14, 0.015);
+          wuv = warpPush(wuv, u_mouthCorners.xy, u_mouthCorners.xy + lift, rMouth, 0.9, aspect);
+          wuv = warpPush(wuv, u_mouthCorners.zw, u_mouthCorners.zw + lift, rMouth, 0.9, aspect);
         }
         wuv = clamp(wuv, vec2(0.0), vec2(1.0));
       }
@@ -235,42 +361,76 @@
       float skinW = skinProbability(orig.rgb);
       float skinArea = (u_hasFaceMask > 0.5) ? (faceSkinMask * mix(0.45, 1.0, skinW)) : (skinW * 0.85);
 
-      // Under-eye crescent mask (gated by faceSkinMask so eyes/lashes remain crisp)
+      // Localized under-eye & nasolabial masks (gated by faceSkinMask so eyes/lips stay crisp)
       float ueW = 0.0;
-      if (u_hasFaceMask > 0.5 && underEyeAmt > 0.001 && faceSkinMask > 0.01) {
-        float ueL = underEyeMask(wuv, u_eyes.xy, u_eyeRadii.x, aspect);
-        float ueR = underEyeMask(wuv, u_eyes.zw, u_eyeRadii.y, aspect);
-        ueW = max(ueL, ueR) * faceSkinMask;
+      float nlW = 0.0;
+      if (u_hasFaceMask > 0.5 && faceSkinMask > 0.01 && faceFade > 0.001) {
+        if (underEyeAmt > 0.001) {
+          float ueL = underEyeMask(wuv, u_eyes.xy, u_eyeRadii.x, aspect);
+          float ueR = underEyeMask(wuv, u_eyes.zw, u_eyeRadii.y, aspect);
+          ueW = max(ueL, ueR) * faceSkinMask;
+        }
+        if (nasolabialAmt > 0.001 && u_eyeRadii.z > 0.01) {
+          float nlWidth = max(u_eyeRadii.z * 0.095, 0.01);
+          vec2 nlL0 = mix(u_noseWings.xy, u_leftContour.xy, 0.16);
+          vec2 nlL1 = mix(u_mouthCorners.xy, u_leftContour.zw, 0.16);
+          vec2 nlR0 = mix(u_noseWings.zw, u_rightContour.xy, 0.16);
+          vec2 nlR1 = mix(u_mouthCorners.zw, u_rightContour.zw, 0.16);
+          nlW = max(segMask(wuv, nlL0, nlL1, nlWidth, aspect), segMask(wuv, nlR0, nlR1, nlWidth, aspect)) * faceSkinMask;
+        }
       }
 
-      // 2) Edge-preserving skin smoothing (+ extra smoothing under eyes)
-      float effSmooth = clamp(smoothAmt + ueW * underEyeAmt * 0.70, 0.0, 1.0);
-      if (skinArea > 0.01 && effSmooth > 0.001) {
-        float radiusScale = 1.6 + effSmooth * 3.0;
-        vec3 smoothed = edgePreservingSmooth(wuv, orig.rgb, effSmooth, radiusScale);
-        float blend = clamp(skinArea * (0.25 + effSmooth * 0.75) * min(effSmooth * 2.2, 1.0) * u_fade, 0.0, 0.94);
-        rgb = mix(rgb, smoothed, blend);
+      // 2) Edge-preserving skin smoothing + texture retention + matte de-shine
+      vec3 smoothed = orig.rgb;
+      float effSmooth = clamp(smoothAmt + ueW * underEyeAmt * 0.70 + nlW * nasolabialAmt * 0.65, 0.0, 1.0);
+      bool didSmooth = false;
+      if (skinArea > 0.01 && (effSmooth > 0.001 || matteAmt > 0.001) && faceFade > 0.001) {
+        float radiusScale = 1.6 + max(effSmooth, matteAmt * 0.5) * 3.0;
+        smoothed = edgePreservingSmooth(wuv, orig.rgb, max(effSmooth, 0.25), skinTexAmt, radiusScale, liteMode);
+        didSmooth = true;
+        if (effSmooth > 0.001) {
+          float blend = clamp(skinArea * (0.25 + effSmooth * 0.75) * min(effSmooth * 2.2, 1.0) * faceFade, 0.0, 0.94);
+          // Optional fine skin texture preservation (prevents plastic look)
+          vec3 microTex = (orig.rgb - smoothed) * (skinTexAmt * 0.34);
+          rgb = mix(rgb, clamp(smoothed + microTex, 0.0, 1.0), blend);
+        }
       }
 
-      // 3) Under-eye dark-circle brightening & subtle warm-peach neutralization
-      if (ueW > 0.01 && underEyeAmt > 0.001) {
-        float ueLift = ueW * underEyeAmt * 0.34 * u_fade;
+      // 2b) Matte / de-shine oil highlight suppression on skin
+      if (skinArea > 0.01 && matteAmt > 0.001 && faceFade > 0.001) {
+        float luma = dot(rgb, vec3(0.299, 0.587, 0.114));
+        float maxC = max(rgb.r, max(rgb.g, rgb.b));
+        float minC = min(rgb.r, min(rgb.g, rgb.b));
+        float chroma = maxC - minC;
+        float glare = smoothstep(0.66, 0.94, luma) * (1.0 - smoothstep(0.16, 0.44, chroma));
+        vec3 baseSkin = didSmooth ? smoothed : rgb;
+        vec3 matteTarget = min(rgb, baseSkin * 0.90 + vec3(0.06, 0.04, 0.03));
+        rgb = mix(rgb, matteTarget, clamp(glare * matteAmt * 0.65 * skinArea * faceFade, 0.0, 0.75));
+      }
+
+      // 3) Under-eye & nasolabial shadow lift
+      if (ueW > 0.01 && underEyeAmt > 0.001 && faceFade > 0.001) {
+        float ueLift = ueW * underEyeAmt * 0.34 * faceFade;
         vec3 ueTarget = rgb + (1.0 - rgb) * vec3(0.96, 0.89, 0.80) * ueLift;
-        rgb = mix(rgb, clamp(ueTarget, 0.0, 1.0), clamp(ueW * u_fade, 0.0, 0.90));
+        rgb = mix(rgb, clamp(ueTarget, 0.0, 1.0), clamp(ueW * faceFade, 0.0, 0.90));
+      }
+      if (nlW > 0.01 && nasolabialAmt > 0.001 && faceFade > 0.001) {
+        float nlLift = nlW * nasolabialAmt * 0.24 * faceFade;
+        rgb = clamp(rgb + (1.0 - rgb) * (vec3(0.98, 0.94, 0.89) * nlLift), 0.0, 1.0);
       }
 
       // 4) Highlight-safe whitening / clear fair skin tone
-      if (skinArea > 0.01 && whitenAmt > 0.001) {
-        float lift = whitenAmt * 0.36 * skinArea * u_fade;
+      if (skinArea > 0.01 && whitenAmt > 0.001 && faceFade > 0.001) {
+        float lift = whitenAmt * 0.36 * skinArea * faceFade;
         rgb = clamp(rgb + (1.0 - rgb) * (vec3(0.97, 0.99, 1.04) * lift), 0.0, 1.0);
       }
 
       // 5) Rosy cheeks & healthy skin warmth
-      if (skinArea > 0.01 && rosyAmt > 0.001) {
+      if (skinArea > 0.01 && rosyAmt > 0.001 && faceFade > 0.001) {
         float cheekW = 0.40;
         if (u_hasFaceMask > 0.5 && u_eyeRadii.z > 0.01) {
-          vec2 lc = mix(u_leftContour.xy, u_noseChin.xy, 0.45);
-          vec2 rc = mix(u_rightContour.xy, u_noseChin.xy, 0.45);
+          vec2 lc = mix(u_leftContour.xy, u_noseBridge.zw, 0.45);
+          vec2 rc = mix(u_rightContour.xy, u_noseBridge.zw, 0.45);
           vec2 dl = wuv - lc; dl.x *= aspect;
           vec2 dr = wuv - rc; dr.x *= aspect;
           float cr = u_eyeRadii.z * 0.30;
@@ -278,40 +438,99 @@
           float wR = 1.0 - smoothstep(0.0, cr, length(dr));
           cheekW = clamp(0.30 + max(wL, wR) * 0.85, 0.0, 1.0);
         }
-        float rAmt = rosyAmt * skinArea * cheekW * 0.35 * u_fade;
+        float rAmt = rosyAmt * skinArea * cheekW * 0.35 * faceFade;
         vec3 blush = mix(rgb, rgb * vec3(1.15, 0.92, 0.94) + vec3(0.07, 0.0, 0.02), rAmt);
         rgb = clamp(blush, 0.0, 1.0);
       }
 
-      // 6) Bright eyes (sclera lift + micro contrast)
-      if (eyeMask > 0.02 && brightEyeAmt > 0.001) {
-        float eAmt = eyeMask * brightEyeAmt * u_fade;
+      // 6) 3D Contour (nose bridge highlight + subtle jawline outer shading)
+      if (u_hasFaceMask > 0.5 && contourAmt > 0.001 && faceSkinMask > 0.01 && u_eyeRadii.z > 0.01 && faceFade > 0.001) {
+        float fw = u_eyeRadii.z;
+        float bridgeW = segMask(wuv, u_noseBridge.xy, u_noseBridge.zw, max(fw * 0.07, 0.008), aspect) * faceSkinMask;
+        float jawEdgeL = segMask(wuv, u_leftContour.xy, u_leftContour.zw, max(fw * 0.16, 0.015), aspect) * faceSkinMask;
+        float jawEdgeR = segMask(wuv, u_rightContour.xy, u_rightContour.zw, max(fw * 0.16, 0.015), aspect) * faceSkinMask;
+        float shadeW = max(jawEdgeL, jawEdgeR);
+        if (bridgeW > 0.01) {
+          rgb = clamp(rgb + (1.0 - rgb) * (bridgeW * contourAmt * 0.18 * faceFade), 0.0, 1.0);
+        }
+        if (shadeW > 0.01) {
+          rgb = clamp(rgb * (1.0 - shadeW * contourAmt * 0.11 * faceFade), 0.0, 1.0);
+        }
+      }
+
+      // 7) Bright eyes (sclera lift + micro contrast)
+      if (eyeMask > 0.02 && brightEyeAmt > 0.001 && faceFade > 0.001) {
+        float eAmt = eyeMask * brightEyeAmt * faceFade;
         float luma = dot(rgb, vec3(0.299, 0.587, 0.114));
         vec3 contrasted = mix(rgb, clamp((rgb - 0.38) * (1.0 + 0.45 * eAmt) + 0.38, 0.0, 1.0), 0.80);
         vec3 eyeBright = contrasted + (1.0 - contrasted) * (0.22 * eAmt * smoothstep(0.25, 0.72, luma));
         rgb = clamp(eyeBright, 0.0, 1.0);
       }
 
-      // 7) Natural lip tint preserving lip shading & highlights
-      if (lipMask > 0.02 && lipTintAmt > 0.001) {
-        float lAmt = lipMask * lipTintAmt * 0.62 * u_fade;
+      // 8) Teeth whitening (neutralizes yellow teeth inside mouth without bleaching pink/red lips)
+      if (u_hasFaceMask > 0.5 && teethAmt > 0.001 && faceFade > 0.001 && u_eyeRadii.z > 0.01) {
+        vec2 dm = wuv - u_chinMouth.zw;
+        dm.x *= aspect;
+        float mouthZone = (1.0 - smoothstep(u_eyeRadii.z * 0.06, u_eyeRadii.z * 0.18, length(dm))) * (1.0 - faceSkinMask * 0.8);
+        if (mouthZone > 0.05) {
+          float luma = dot(rgb, vec3(0.299, 0.587, 0.114));
+          float maxC = max(rgb.r, max(rgb.g, rgb.b));
+          float minC = min(rgb.r, min(rgb.g, rgb.b));
+          float redExcess = rgb.r - rgb.b;
+          float isTooth = smoothstep(0.42, 0.65, luma) * (1.0 - smoothstep(0.14, 0.28, redExcess)) * (1.0 - smoothstep(0.18, 0.34, maxC - minC));
+          float tAmt = isTooth * mouthZone * teethAmt * 0.65 * faceFade;
+          if (tAmt > 0.01) {
+            vec3 cleanWhite = mix(rgb, vec3(min(1.0, luma * 1.12 + 0.08)), 0.72);
+            rgb = clamp(mix(rgb, cleanWhite, tAmt), 0.0, 1.0);
+          }
+        }
+      }
+
+      // 9) Natural lip tint using selected lipShade RGB
+      if (lipMask > 0.02 && lipTintAmt > 0.001 && faceFade > 0.001) {
+        float lAmt = lipMask * lipTintAmt * 0.62 * faceFade;
         float lipLuma = dot(rgb, vec3(0.299, 0.587, 0.114));
-        vec3 tintColor = vec3(0.94, 0.32, 0.42);
-        vec3 softLip = mix(rgb, rgb * vec3(1.18, 0.76, 0.82) + tintColor * (0.24 * (1.0 - lipLuma)), lAmt);
+        vec3 mulTone = mix(vec3(1.0), lipShadeRgb * 1.25, 0.65);
+        vec3 softLip = mix(rgb, rgb * mulTone + lipShadeRgb * (0.28 * (1.0 - lipLuma)), lAmt);
         rgb = clamp(softLip, 0.0, 1.0);
       }
 
-      // 8) Clarity / detail sharpen (stronger on eyes/brows/lips/hair, gentle on smoothed skin)
-      float effSharp = sharpenAmt * 0.65 + eyeMask * brightEyeAmt * 0.45;
-      if (u_liteMode < 0.5 && effSharp > 0.005) {
+      // 10) Clarity / detail sharpen (global + eye boost, gentle on smoothed skin)
+      float effSharp = sharpenAmt * 0.65 + eyeMask * brightEyeAmt * 0.45 * faceFade;
+      if (liteMode < 0.5 && effSharp > 0.005) {
         vec3 n1 = texture2D(u_video, clamp(wuv + vec2( u_texel.x, 0.0), vec2(0.0), vec2(1.0))).rgb;
         vec3 n2 = texture2D(u_video, clamp(wuv + vec2(-u_texel.x, 0.0), vec2(0.0), vec2(1.0))).rgb;
         vec3 n3 = texture2D(u_video, clamp(wuv + vec2(0.0,  u_texel.y), vec2(0.0), vec2(1.0))).rgb;
         vec3 n4 = texture2D(u_video, clamp(wuv + vec2(0.0, -u_texel.y), vec2(0.0), vec2(1.0))).rgb;
         vec3 detail = orig.rgb - 0.25 * (n1 + n2 + n3 + n4);
-        float sharpGate = mix(1.0, 1.0 - smoothAmt * 0.75, skinArea);
+        float sharpGate = mix(1.0, 1.0 - smoothAmt * 0.72 * faceFade, skinArea);
         sharpGate = max(sharpGate, eyeMask);
-        rgb = clamp(rgb + detail * (effSharp * sharpGate * u_fade), 0.0, 1.0);
+        rgb = clamp(rgb + detail * (effSharp * sharpGate), 0.0, 1.0);
+      }
+
+      // 11) Full-frame color grading (exposure, contrast, saturation, temperature, soft glow)
+      if (abs(exposureAmt) > 0.001) {
+        rgb = clamp(rgb * pow(2.0, exposureAmt * 0.50), 0.0, 1.0);
+      }
+      if (abs(contrastAmt) > 0.001) {
+        rgb = clamp((rgb - 0.5) * (1.0 + contrastAmt * 0.48) + 0.5, 0.0, 1.0);
+      }
+      if (abs(satAmt) > 0.001) {
+        float lum = dot(rgb, vec3(0.299, 0.587, 0.114));
+        rgb = clamp(mix(vec3(lum), rgb, 1.0 + satAmt * 0.55), 0.0, 1.0);
+      }
+      if (abs(tempAmt) > 0.001) {
+        rgb = clamp(rgb * vec3(1.0 + tempAmt * 0.12, 1.0 + tempAmt * 0.02, 1.0 - tempAmt * 0.14), 0.0, 1.0);
+      }
+      if (softGlowAmt > 0.005 && liteMode < 0.5) {
+        vec2 gStep = u_texel * 3.5;
+        vec3 g1 = texture2D(u_video, clamp(wuv + vec2( gStep.x,  gStep.y), vec2(0.0), vec2(1.0))).rgb;
+        vec3 g2 = texture2D(u_video, clamp(wuv + vec2(-gStep.x,  gStep.y), vec2(0.0), vec2(1.0))).rgb;
+        vec3 g3 = texture2D(u_video, clamp(wuv + vec2( gStep.x, -gStep.y), vec2(0.0), vec2(1.0))).rgb;
+        vec3 g4 = texture2D(u_video, clamp(wuv + vec2(-gStep.x, -gStep.y), vec2(0.0), vec2(1.0))).rgb;
+        vec3 glowAvg = 0.25 * (g1 + g2 + g3 + g4);
+        vec3 bloom = max(glowAvg - vec3(0.50), vec3(0.0)) * 1.45;
+        rgb = clamp(1.0 - (1.0 - rgb) * (1.0 - bloom * (softGlowAmt * 0.48)), 0.0, 1.0);
       }
 
       gl_FragColor = vec4(rgb, 1.0);
@@ -968,16 +1187,22 @@
         u_video: u("u_video"),
         u_mask: u("u_mask"),
         u_texel: u("u_texel"),
-        u_fade: u("u_fade"),
         u_hasFaceMask: u("u_hasFaceMask"),
         u_compareOriginal: u("u_compareOriginal"),
-        u_liteMode: u("u_liteMode"),
-        u_skinParams: u("u_skinParams"),
-        u_detailParams: u("u_detailParams"),
-        u_reshapeParams: u("u_reshapeParams"),
+        u_skinA: u("u_skinA"),
+        u_skinB: u("u_skinB"),
+        u_reshapeA: u("u_reshapeA"),
+        u_reshapeB: u("u_reshapeB"),
+        u_makeupA: u("u_makeupA"),
+        u_lipColor: u("u_lipColor"),
+        u_colorA: u("u_colorA"),
+        u_colorB: u("u_colorB"),
         u_eyes: u("u_eyes"),
+        u_eyeOuter: u("u_eyeOuter"),
         u_eyeRadii: u("u_eyeRadii"),
-        u_noseChin: u("u_noseChin"),
+        u_noseBridge: u("u_noseBridge"),
+        u_chinMouth: u("u_chinMouth"),
+        u_mouthCorners: u("u_mouthCorners"),
         u_leftContour: u("u_leftContour"),
         u_rightContour: u("u_rightContour"),
         u_noseWings: u("u_noseWings"),
@@ -1365,16 +1590,22 @@
         this.canvas && this.canvas.height > 0 ? this.canvas.width / this.canvas.height : 16 / 9;
       const distAspect = (a, b) => Math.hypot((a[0] - b[0]) * aspect, a[1] - b[1]);
 
-      // Compute semantic face anchors & yaw symmetry for reshape & under-eye / rosy effects
+      // Compute semantic face anchors & yaw symmetry for reshape, contour, under-eye, nasolabial & mouth effects
       const lEye = avgUv([33, 133, 159, 145]);
       const rEye = avgUv([263, 362, 386, 374]);
-      const lEyeR = Math.max(0.015, distAspect(ptUv(33), ptUv(133)) * 1.15);
-      const rEyeR = Math.max(0.015, distAspect(ptUv(263), ptUv(362)) * 1.15);
+      const lEyeOuter = ptUv(33);
+      const rEyeOuter = ptUv(263);
+      const lEyeR = Math.max(0.015, distAspect(lEyeOuter, ptUv(133)) * 1.15);
+      const rEyeR = Math.max(0.015, distAspect(rEyeOuter, ptUv(362)) * 1.15);
       const leftEar = ptUv(234);
       const rightEar = ptUv(454);
       const forehead = ptUv(10);
       const chin = ptUv(152);
+      const bridgeTop = ptUv(168);
       const noseTip = ptUv(1);
+      const mouthCenter = avgUv([13, 14, 61, 291]);
+      const leftMouth = ptUv(61);
+      const rightMouth = ptUv(291);
       const faceWidth = Math.max(0.04, distAspect(leftEar, rightEar));
       const faceHeight = Math.max(0.05, distAspect(forehead, chin));
       const leftCheek = ptUv(132);
@@ -1391,8 +1622,11 @@
 
       this.faceAnchors = {
         eyes: [lEye[0], lEye[1], rEye[0], rEye[1]],
+        eyeOuter: [lEyeOuter[0], lEyeOuter[1], rEyeOuter[0], rEyeOuter[1]],
         eyeRadii: [lEyeR, rEyeR, faceWidth, faceHeight],
-        noseChin: [noseTip[0], noseTip[1], chin[0], chin[1]],
+        noseBridge: [bridgeTop[0], bridgeTop[1], noseTip[0], noseTip[1]],
+        chinMouth: [chin[0], chin[1], mouthCenter[0], mouthCenter[1]],
+        mouthCorners: [leftMouth[0], leftMouth[1], rightMouth[0], rightMouth[1]],
         leftContour: [leftCheek[0], leftCheek[1], leftJaw[0], leftJaw[1]],
         rightContour: [rightCheek[0], rightCheek[1], rightJaw[0], rightJaw[1]],
         noseWings: [leftWing[0], leftWing[1], rightWing[0], rightWing[1]],
@@ -1496,28 +1730,48 @@
       const aspect = this.canvas.height > 0 ? this.canvas.width / this.canvas.height : 16 / 9;
       const a = this.faceAnchors;
       const uvT = this.uvTransform || [1, 1, 0, 0];
+      const shadeIdx = Math.max(0, Math.min(LIP_SHADE_RGB.length - 1, Math.round(p.lipShade ?? 2)));
+      const lipRgb = LIP_SHADE_RGB[shadeIdx];
 
       gl.uniform4f(this.uniforms.u_uvTransform, uvT[0], uvT[1], uvT[2], uvT[3]);
       gl.uniform2f(this.uniforms.u_texel, 1.0 / this.canvas.width, 1.0 / this.canvas.height);
-      gl.uniform1f(this.uniforms.u_fade, this.fadeWeight);
       gl.uniform1f(this.uniforms.u_hasFaceMask, hasFaceMask ? 1.0 : 0.0);
       gl.uniform1f(this.uniforms.u_compareOriginal, this.compareOriginal ? 1.0 : 0.0);
-      gl.uniform1f(this.uniforms.u_liteMode, this.degradeTier === "L2" ? 1.0 : 0.0);
 
-      gl.uniform4f(this.uniforms.u_skinParams, p.smooth, p.whiten, p.rosy, p.sharpen);
+      gl.uniform4f(this.uniforms.u_skinA, p.smooth, p.skinTexture, p.whiten, p.rosy);
       gl.uniform4f(
-        this.uniforms.u_detailParams,
+        this.uniforms.u_skinB,
         p.underEye,
-        p.brightEye,
-        p.lipTint,
+        p.nasolabial,
+        p.matte,
         hasFaceMask && a ? a.yawFactor : 0.0
       );
-      gl.uniform4f(this.uniforms.u_reshapeParams, p.slimFace, p.bigEyes, p.slimNose, aspect);
+      gl.uniform4f(this.uniforms.u_reshapeA, p.slimFace, p.slimCheekbone, p.vChin, p.bigEyes);
+      gl.uniform4f(this.uniforms.u_reshapeB, p.eyeTilt, p.slimNose, p.mouthSize, p.mouthSmile);
+      gl.uniform4f(this.uniforms.u_makeupA, p.brightEye, p.contour, p.lipTint, p.whitenTeeth);
+      gl.uniform4f(this.uniforms.u_lipColor, lipRgb[0], lipRgb[1], lipRgb[2], aspect);
+      gl.uniform4f(this.uniforms.u_colorA, p.sharpen, p.exposure, p.contrast, p.saturation);
+      gl.uniform4f(
+        this.uniforms.u_colorB,
+        p.temperature,
+        p.softGlow,
+        this.fadeWeight,
+        this.degradeTier === "L2" ? 1.0 : 0.0
+      );
 
       if (hasFaceMask && a) {
         gl.uniform4f(this.uniforms.u_eyes, a.eyes[0], a.eyes[1], a.eyes[2], a.eyes[3]);
+        gl.uniform4f(this.uniforms.u_eyeOuter, a.eyeOuter[0], a.eyeOuter[1], a.eyeOuter[2], a.eyeOuter[3]);
         gl.uniform4f(this.uniforms.u_eyeRadii, a.eyeRadii[0], a.eyeRadii[1], a.eyeRadii[2], a.eyeRadii[3]);
-        gl.uniform4f(this.uniforms.u_noseChin, a.noseChin[0], a.noseChin[1], a.noseChin[2], a.noseChin[3]);
+        gl.uniform4f(this.uniforms.u_noseBridge, a.noseBridge[0], a.noseBridge[1], a.noseBridge[2], a.noseBridge[3]);
+        gl.uniform4f(this.uniforms.u_chinMouth, a.chinMouth[0], a.chinMouth[1], a.chinMouth[2], a.chinMouth[3]);
+        gl.uniform4f(
+          this.uniforms.u_mouthCorners,
+          a.mouthCorners[0],
+          a.mouthCorners[1],
+          a.mouthCorners[2],
+          a.mouthCorners[3]
+        );
         gl.uniform4f(
           this.uniforms.u_leftContour,
           a.leftContour[0],

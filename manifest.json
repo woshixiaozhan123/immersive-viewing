@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "实时美颜",
-  "version": "1.0.0",
-  "description": "本机离线实时网页视频美颜扩展（MV3 + WebGL + MediaPipe 478 点人脸追踪），支持 Wink 风格分项美肤、轻度微整形、风格预设与 JSON 导入导出。",
+  "version": "1.1.0",
+  "description": "本机离线实时网页视频美颜扩展（MV3 + WebGL + MediaPipe 478 点人脸追踪），支持 26 项 Wink/剪映专业分项美肤、美型、美妆与画面调色，内置风格预设与 JSON 导入导出。",
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
