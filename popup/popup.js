@@ -266,6 +266,42 @@ const PRESETS = {
       softGlow: 0.12,
     },
   },
+  youthful: {
+    name: "减龄打底",
+    params: {
+      ...ZERO_PARAMS,
+      // 美肤：经典磨皮30 + 减龄打底 + 冷调白 + 雪冻浅腮红
+      smooth: 0.42,
+      skinTexture: 0.32,
+      whiten: 0.56,
+      rosy: 0.14,
+      underEye: 0.34,
+      nasolabial: 0.26,
+      matte: 0.24,
+      // 美型：小脸+20 / 颧骨+8 / 大眼+10眼高+8 / 眼睛倾斜-29 / 瘦鼻+34 / 丰唇+22
+      slimFace: 0.28,
+      slimCheekbone: 0.10,
+      vChin: 0.12,
+      bigEyes: 0.20,
+      eyeTilt: -0.58,
+      slimNose: 0.34,
+      mouthSize: 0.22,
+      mouthSmile: 0.12,
+      // 美妆：眼窝+41 / 修容立体+65 / 豆沙口红+18
+      brightEye: 0.42,
+      contour: 0.65,
+      lipTint: 0.18,
+      lipShade: 2,
+      whitenTeeth: 0.20,
+      // 调色：饱和度-20 / 色温-8 / 清透微提亮
+      sharpen: 0.26,
+      exposure: 0.12,
+      contrast: 0.08,
+      saturation: -0.40,
+      temperature: -0.16,
+      softGlow: 0.14,
+    },
+  },
   reset: {
     name: "归零",
     params: { ...ZERO_PARAMS },
