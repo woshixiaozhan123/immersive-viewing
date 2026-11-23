@@ -552,7 +552,7 @@ function showIoStatus(msg, isError = false) {
   if (msg) {
     setTimeout(() => {
       if (els.ioStatus.textContent === msg) els.ioStatus.textContent = "";
-    }, 2600);
+    }, 5000);
   }
 }
 
@@ -760,21 +760,288 @@ function setupTabs() {
   }
 }
 
-async function applyImportedJsonText(rawText) {
-  try {
-    const parsed = JSON.parse(rawText);
-    const { params, matched } = normalizeParams(parsed, ZERO_PARAMS);
-    if (matched === 0) {
-      showIoStatus("JSON 中未识别到有效美颜参数字段", true);
-      return;
+const SECTION_HEADERS = [
+  { re: /^(?:先大轮廓|大轮廓|身材|美体)\s*[:：]?\s*/, section: "body" },
+  { re: /^(?:面部调整|面部|美型|脸部)\s*[:：]?\s*/, section: "face" },
+  { re: /^(?:眼睛|眼部)\s*[:：]?\s*/, section: "eye" },
+  { re: /^(?:鼻子|鼻部)\s*[:：]?\s*/, section: "nose" },
+  { re: /^(?:嘴巴|嘴部|唇部)\s*[:：]?\s*/, section: "mouth" },
+  { re: /^(?:眉毛|眉部)\s*[:：]?\s*/, section: "brow" },
+  { re: /^(?:处理皮肤|皮肤|美肤|肤质)\s*[:：]?\s*/, section: "skin" },
+  { re: /^(?:美妆|妆容)\s*[:：]?\s*/, section: "makeup" },
+  { re: /^(?:美发|头发)\s*[:：]?\s*/, section: "hair" },
+  { re: /^(?:调色|画质|滤镜)\s*[:：]?\s*/, section: "color" },
+];
+
+const UNSUPPORTED_RECIPE_TOKENS = [
+  "小头", "天鹅颈", "直角肩", "瘦腰", "瘦腿", "长腿", "增高", "缩肩",
+  "染发", "发际线", "高颅顶", "蓬松", "眉毛", "色调", "颗粒", "褪色",
+];
+
+function detectLipShadeFromText(text) {
+  if (/裸粉|奶茶|nude/i.test(text)) return 0;
+  if (/蜜桃|橘|珊瑚|西柚|peach|coral/i.test(text)) return 1;
+  if (/豆沙|玫瑰|干枯玫瑰|rose/i.test(text)) return 2;
+  if (/正红|复古红|车厘子|酒红|红棕色|red/i.test(text)) return 3;
+  return null;
+}
+
+function parseWinkTextRecipe(rawText) {
+  const out = { ...ZERO_PARAMS };
+  const matchedKeys = new Set();
+  const skipped = [];
+  const addSkipped = (label) => {
+    const clean = label.replace(/[:：/].*$/, "").trim();
+    if (clean && !skipped.includes(clean)) skipped.push(clean);
+  };
+  const setVal = (key, rawVal, { additive = false, scale = 1 } = {}) => {
+    const scaled = rawVal * scale;
+    const norm = clampParam(key, scaled, out[key]);
+    if (additive && matchedKeys.has(key)) {
+      if (BIPOLAR_KEYS.has(key)) {
+        out[key] = Math.max(-1, Math.min(1, out[key] + norm));
+      } else {
+        out[key] = Math.max(0, Math.min(1, out[key] + norm));
+      }
+    } else {
+      out[key] = norm;
     }
-    currentParams = params;
-    syncSlidersUI(currentParams);
-    await persistAndPushParams();
-    showIoStatus(`已导入并应用 ${matched} 项参数`);
-  } catch (err) {
-    showIoStatus(`JSON 格式错误：${err.message}`, true);
+    matchedKeys.add(key);
+  };
+
+  let section = "general";
+  let hasCoolWhiteHint = false;
+  let hasYouthBaseHint = false;
+
+  const lines = rawText.split(/\r?\n/);
+  for (const origLine of lines) {
+    let line = origLine.trim();
+    if (!line) continue;
+
+    if (/一键美颜|减龄打底/.test(line)) {
+      hasYouthBaseHint = true;
+    }
+
+    // Detect leading section header (e.g. "眼睛：" or "眼睛：大小+10 倾斜-29")
+    for (const h of SECTION_HEADERS) {
+      const m = line.match(h.re);
+      if (m) {
+        const isStandaloneHeader = m[0].length === line.length;
+        const hasColon = /[:：]/.test(m[0]);
+        if (isStandaloneHeader || hasColon) {
+          section = h.section;
+          line = line.slice(m[0].length).trim();
+          break;
+        }
+      }
+    }
+    if (!line) continue;
+
+    // Extract all "label [sep] signedNumber" pairs (works even when glued like "色温-8色调+6")
+    const pairRe = /([\u4e00-\u9fa5A-Za-z_/]+)\s*[:：=]?\s*([+-]?\d+(?:\.\d+)?)/g;
+    let match;
+    let lineMatchedPair = false;
+    while ((match = pairRe.exec(line)) !== null) {
+      lineMatchedPair = true;
+      const rawLabel = match[1].trim();
+      const num = Number(match[2]);
+      if (!Number.isFinite(num)) continue;
+
+      // Check explicitly unsupported global keywords first
+      const unsupportedHit = UNSUPPORTED_RECIPE_TOKENS.find((t) => rawLabel.includes(t));
+      if (unsupportedHit) {
+        addSkipped(unsupportedHit);
+        continue;
+      }
+
+      // Unambiguous global face/color keywords (work even if a previous section lacked a reset header)
+      if (/磨皮|肤质/.test(rawLabel)) {
+        section = "skin";
+        setVal("smooth", Math.abs(num));
+      } else if (/质感|毛孔/.test(rawLabel)) {
+        section = "skin";
+        setVal("skinTexture", Math.abs(num));
+      } else if (/冷调白|冷白|美白|提亮/.test(rawLabel)) {
+        section = "skin";
+        setVal("whiten", Math.abs(num));
+        if (/冷调白|冷白/.test(rawLabel)) hasCoolWhiteHint = true;
+      } else if (/腮红|红润|气色/.test(rawLabel)) {
+        section = "skin";
+        setVal("rosy", Math.abs(num));
+      } else if (/黑眼圈/.test(rawLabel)) {
+        section = "skin";
+        setVal("underEye", Math.abs(num));
+      } else if (/法令纹/.test(rawLabel)) {
+        section = "skin";
+        setVal("nasolabial", Math.abs(num));
+      } else if (/去油光|控油|哑光/.test(rawLabel)) {
+        section = "skin";
+        setVal("matte", Math.abs(num));
+      } else if (/窄颧骨|瘦颧骨|颧骨/.test(rawLabel)) {
+        section = "face";
+        setVal("slimCheekbone", Math.abs(num));
+      } else if (/小脸|瘦脸/.test(rawLabel)) {
+        section = "face";
+        setVal("slimFace", Math.abs(num));
+      } else if (/下巴|v脸/i.test(rawLabel)) {
+        section = "face";
+        setVal("vChin", num);
+      } else if (/眼睛倾斜|眼倾斜|眼尾上扬|眼尾|眼角倾斜/.test(rawLabel)) {
+        section = "eye";
+        setVal("eyeTilt", num);
+      } else if (/大眼|眼睛大小|眼高|眼宽/.test(rawLabel)) {
+        section = "eye";
+        setVal("bigEyes", Math.abs(num), { additive: true });
+      } else if (/瘦鼻|缩鼻翼|鼻子大小|鼻翼|鼻头/.test(rawLabel)) {
+        section = "nose";
+        setVal("slimNose", Math.abs(num));
+      } else if (/鼻梁|山根/.test(rawLabel)) {
+        section = "nose";
+        setVal("contour", Math.abs(num), { additive: true, scale: 0.7 });
+      } else if (/丰唇/.test(rawLabel)) {
+        section = "mouth";
+        setVal("mouthSize", num, { scale: 0.5 });
+      } else if (/嘴型|嘴巴大小/.test(rawLabel)) {
+        section = "mouth";
+        setVal("mouthSize", num);
+      } else if (/微笑|嘴角/.test(rawLabel)) {
+        section = "mouth";
+        setVal("mouthSmile", Math.abs(num));
+      } else if (/眼影|眼窝|亮眼|卧蚕|美瞳|睫毛/.test(rawLabel)) {
+        section = "makeup";
+        setVal("brightEye", Math.abs(num));
+      } else if (/修容|鼻影/.test(rawLabel)) {
+        section = "makeup";
+        setVal("contour", Math.abs(num));
+      } else if (/口红|润唇|唇釉|唇彩/.test(rawLabel)) {
+        section = "makeup";
+        setVal("lipTint", Math.abs(num));
+        const shade = detectLipShadeFromText(rawLabel);
+        if (shade !== null) {
+          out.lipShade = shade;
+          matchedKeys.add("lipShade");
+        }
+      } else if (/美牙|牙齿|白牙/.test(rawLabel)) {
+        section = "makeup";
+        setVal("whitenTeeth", Math.abs(num));
+      } else if (/清晰|锐化/.test(rawLabel)) {
+        section = "color";
+        setVal("sharpen", Math.abs(num));
+      } else if (/曝光|亮度/.test(rawLabel)) {
+        section = "color";
+        setVal("exposure", num);
+      } else if (/对比度/.test(rawLabel)) {
+        section = "color";
+        setVal("contrast", num);
+      } else if (/饱和度/.test(rawLabel)) {
+        section = "color";
+        setVal("saturation", num);
+      } else if (/色温/.test(rawLabel)) {
+        section = "color";
+        setVal("temperature", num);
+      } else if (/柔光/.test(rawLabel)) {
+        section = "color";
+        setVal("softGlow", Math.abs(num));
+      } else if (section === "body" || section === "hair" || section === "brow") {
+        // Section-scoped skip for ambiguous labels inside 眉毛 / 身材 / 美发 (e.g. 眉毛：倾斜+19, 上下-50)
+        addSkipped(section === "brow" ? `眉毛${rawLabel}` : rawLabel);
+      } else if (section === "eye") {
+        if (/倾斜/.test(rawLabel)) setVal("eyeTilt", num);
+        else if (/大小|高度|眼高/.test(rawLabel)) setVal("bigEyes", Math.abs(num), { additive: true });
+        else addSkipped(`眼睛${rawLabel}`);
+      } else if (section === "nose") {
+        if (/大小|鼻翼|鼻头/.test(rawLabel)) setVal("slimNose", Math.abs(num));
+        else if (/鼻梁|山根/.test(rawLabel)) setVal("contour", Math.abs(num), { additive: true, scale: 0.7 });
+        else addSkipped(`鼻子${rawLabel}`);
+      } else if (section === "mouth") {
+        if (/大小|宽度/.test(rawLabel)) setVal("mouthSize", num);
+        else if (/微笑/.test(rawLabel)) setVal("mouthSmile", Math.abs(num));
+        else addSkipped(`嘴巴${rawLabel}`);
+      } else {
+        // Fallback: check standard English/Chinese KEY_ALIASES
+        let aliasHit = false;
+        for (const [k, aliases] of Object.entries(KEY_ALIASES)) {
+          if (aliases.some((a) => a.toLowerCase() === rawLabel.toLowerCase())) {
+            setVal(k, num);
+            aliasHit = true;
+            break;
+          }
+        }
+        if (!aliasHit) addSkipped(rawLabel);
+      }
+    }
+
+    // Handle qualitative lines without numbers (e.g. "美白/冷调白默认参数", "腮红/雪冻", "卧蚕/月牙")
+    if (!lineMatchedPair) {
+      if (section === "hair" || /染发|美发/.test(line)) {
+        addSkipped("染发");
+      } else if (/美白|冷调白|冷白/.test(line)) {
+        setVal("whiten", /冷调白|冷白/.test(line) ? 52 : 40);
+        if (/冷调白|冷白/.test(line)) hasCoolWhiteHint = true;
+      } else if (/腮红/.test(line) && !matchedKeys.has("rosy")) {
+        setVal("rosy", 16);
+      } else if (/美瞳|卧蚕|睫毛/.test(line) && !matchedKeys.has("brightEye")) {
+        setVal("brightEye", 28);
+      } else if (/口红|润唇|唇釉/.test(line)) {
+        const shade = detectLipShadeFromText(line);
+        if (shade !== null) {
+          out.lipShade = shade;
+          matchedKeys.add("lipShade");
+        }
+        if (!matchedKeys.has("lipTint")) setVal("lipTint", 20);
+      }
+    }
   }
+
+  // Apply gentle defaults if qualitative recipe hints appeared without explicit numbers
+  if (hasYouthBaseHint && matchedKeys.size > 0) {
+    if (!matchedKeys.has("skinTexture")) out.skinTexture = 0.30;
+    if (!matchedKeys.has("underEye")) out.underEye = 0.30;
+    if (!matchedKeys.has("nasolabial")) out.nasolabial = 0.24;
+    if (!matchedKeys.has("matte")) out.matte = 0.20;
+    if (!matchedKeys.has("sharpen")) out.sharpen = 0.25;
+  }
+  if (hasCoolWhiteHint && !matchedKeys.has("temperature")) {
+    out.temperature = -0.14;
+    matchedKeys.add("temperature");
+  }
+
+  return { params: out, matched: matchedKeys.size, skipped };
+}
+
+async function applyImportedJsonText(rawText) {
+  const trimmed = rawText.trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      const { params, matched } = normalizeParams(parsed, ZERO_PARAMS);
+      if (matched === 0) {
+        showIoStatus("JSON 中未识别到有效美颜参数字段", true);
+        return;
+      }
+      currentParams = params;
+      syncSlidersUI(currentParams);
+      await persistAndPushParams();
+      showIoStatus(`已导入并应用 ${matched} 项 JSON 参数`);
+    } catch (err) {
+      showIoStatus(`JSON 格式错误：${err.message}`, true);
+    }
+    return;
+  }
+
+  // Plain-text Wink / Xiaohongshu recipe parser
+  const { params, matched, skipped } = parseWinkTextRecipe(trimmed);
+  if (matched === 0) {
+    showIoStatus("未识别到有效 JSON 或 Wink 配方参数", true);
+    return;
+  }
+  currentParams = params;
+  syncSlidersUI(currentParams);
+  await persistAndPushParams();
+  const skipNote = skipped.length
+    ? `（忽略：${skipped.slice(0, 3).join("、")}${skipped.length > 3 ? ` 等${skipped.length}项` : ""}）`
+    : "";
+  showIoStatus(`已解析并应用 ${matched} 项配方${skipNote}`);
 }
 
 async function init() {
