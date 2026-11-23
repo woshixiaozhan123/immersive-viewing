@@ -1,8 +1,9 @@
-# 实时美颜（Chromium MV3）
+# 实时美颜（桌面 Chromium MV3 + iOS Safari）
 
-> 本机离线实时网页视频美颜浏览器扩展 —— **WebGL 单 Pass 美肤/微整形 + MediaPipe 478 点离主线程人脸追踪**，无需服务器、不上传任何视频帧，零后台常驻开销。
+> 本机实时网页视频美颜方案 —— **WebGL 单 Pass 26 项美颜/微整形 + MediaPipe 478 点人脸追踪**，无需服务器、不上传任何视频帧，桌面扩展零后台常驻开销，同时提供支持 **剧场全屏 + 一键 90° 横屏** 的 iOS Safari 用户脚本。
 
 [![Manifest V3](https://img.shields.io/badge/Manifest-V3-38bdf8?style=flat-square)](#)
+[![iOS Safari Userscript](https://img.shields.io/badge/iOS-Safari%20Userscript-a855f7?style=flat-square)](#ios-safari-安装与横屏全屏)
 [![WebGL + MediaPipe](https://img.shields.io/badge/Engine-WebGL%20%2B%20MediaPipe%20478-ec4899?style=flat-square)](#)
 [![License: MIT](https://img.shields.io/badge/License-MIT-10b981?style=flat-square)](LICENSE)
 
@@ -43,10 +44,10 @@ flowchart LR
 
 ---
 
-## 快速安装
+## 快速安装（桌面端 Chromium 浏览器）
 
 ### 方式一：直接下载 Release 预构建包（推荐普通用户）
-1. 前往本仓库 **Releases** 页面下载 `realtime-beauty-v1.1.0.zip` 并解压。
+1. 前往 [Releases 页面](https://github.com/woshixiaozhan123/realtime-beauty/releases) 下载 `realtime-beauty-v1.1.0.zip` 并解压。
 2. 打开浏览器扩展管理页：
    - Chrome：`chrome://extensions`
    - Edge：`edge://extensions`
@@ -58,7 +59,7 @@ flowchart LR
 > 需要 Node.js >= 18（零 npm 第三方运行时依赖）。
 
 ```bash
-git clone https://github.com/<your-username>/realtime-beauty.git
+git clone https://github.com/woshixiaozhan123/realtime-beauty.git
 cd realtime-beauty
 
 # 1. 下载官方离线 MediaPipe WASM 与 478 点人脸模型到 vendor/mediapipe/
@@ -71,7 +72,23 @@ npm run check
 npm run build
 ```
 
-> 若跳过 `npm run setup` 直接加载源码，扩展依然可以正常运行，并自动进入 **「WebGL 肤色保边回退模式」**（磨皮 / 美白 / 红润 / 清晰锐化立即可用）。
+> 若跳过 `npm run setup` 直接加载源码，扩展依然可以正常运行，并自动进入 **「WebGL 肤色保边回退模式」**（磨皮 / 质感保留 / 美白 / 红润 / 去油光 / 全部 6 项画面调色立即可用）。
+
+---
+
+## iOS Safari 安装与横屏全屏
+
+仓库内置与桌面端完全同步的 iOS Safari 用户脚本：[ios/realtime-beauty-ios.user.js](ios/realtime-beauty-ios.user.js)（同样具备全部 26 项参数、7 档预设、Wink 中文配方解析与可选 478 点追踪）。
+
+### 安装步骤（Userscripts / Stay）
+1. 在 App Store 安装免费开源的 **Userscripts**（或 **Stay**），并在 iOS「设置 → Safari 浏览器 → 扩展」中开启并授予网站权限。
+2. 下载或直接从 Raw 链接安装脚本：
+   `https://raw.githubusercontent.com/woshixiaozhan123/realtime-beauty/main/ios/realtime-beauty-ios.user.js`
+3. 若使用 **Userscripts**：将脚本保存到 iCloud Drive /「我的 iPhone」下的 Userscripts 目录，刷新 Safari 视频页即可在右下角看到悬浮球。
+
+### iOS 美颜剧场全屏 & 90° 横屏
+- iOS 原生视频全屏会由系统 `AVPlayer` 接管并遮挡网页叠层；点击悬浮球旁的 **`⛶ 全屏`**（或面板底部的 **`⛶ 美颜全屏`**）即可进入美颜剧场全屏，完整保留美颜、进度条拖拽、倍速和实时调参。
+- 即使手机开启了「竖排方向锁定」，点右上角 **`↻ 横屏90°`** 也能一键旋转横屏铺满观看。
 
 ---
 
@@ -96,6 +113,7 @@ realtime-beauty/
 ├── popup/                    # 26 项 Wink/剪映专业分项调参面板、预设、JSON 方案与诊断
 ├── content/engine.js         # 主引擎：选源、多播放器适配、EME/CORS探针、WebGL管线、L0-L3降级
 ├── worker/face-worker.js     # 离主线程 MediaPipe 478 点推理、主脸锁定与 One-Euro 滤波
+├── ios/                      # iOS Safari 用户脚本（26 项调参 + 美颜剧场全屏 + 90° 横屏）
 ├── vendor/mediapipe/         # 离线 MediaPipe 模型与 ES Module WASM（npm run setup 拉取）
 ├── test-page/index.html      # 可控边界测试页（双人脸、同源iframe、cover/contain、全屏、EME）
 ├── scripts/                  # setup / check / build 零依赖 Node 脚本
