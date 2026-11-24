@@ -271,6 +271,7 @@ def _library_item(safe_key: str) -> Optional[dict[str, Any]]:
         "bandwidth": meta.get("bandwidth") or 0,
         "lastAccessAt": meta.get("lastAccessAt") or "",
         "playable": bool(len(cached_idx)),
+        "hasPrescan": (entry / "landmarks.bin").exists() and (entry / "landmarks.json").exists(),
     }
 
 

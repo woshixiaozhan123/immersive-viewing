@@ -83,6 +83,13 @@ CACHE_SWEEP_INTERVAL_MIN: int = int(os.environ.get("RB_CACHE_SWEEP_INTERVAL_MIN"
 # 服务启动后多久跑第一次（秒），避开启动瞬间的 IO
 CACHE_SWEEP_FIRST_DELAY_SEC: int = int(os.environ.get("RB_CACHE_SWEEP_FIRST_DELAY", "45"))
 
+# ---------------------------------------------------------------------------
+# 离线人脸关键点预扫（HANDOVER-PRESCAN.md）
+# ---------------------------------------------------------------------------
+PRESCAN_FPS: int = max(1, int(os.environ.get("RB_PRESCAN_FPS", "4")))
+PRESCAN_MAX_FRAMES: int = max(100, int(os.environ.get("RB_PRESCAN_MAX_FRAMES", "400000")))
+PRESCAN_AUTO: bool = os.environ.get("RB_PRESCAN_AUTO", "false").strip().lower() == "true"
+
 FFMPEG_PATH: str = _resolve_binary("RB_FFMPEG_PATH", "ffmpeg")
 FFPROBE_PATH: str = _resolve_binary("RB_FFPROBE_PATH", "ffprobe")
 

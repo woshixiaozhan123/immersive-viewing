@@ -15,6 +15,8 @@ from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 import config
+import prescan
+import prescan_api
 import webui
 from hls_proxy import TransparentHlsCache, b64d, safe_key_of
 from maintenance import CacheSweeper
@@ -88,6 +90,9 @@ async def lifespan(_app: FastAPI):
         config.GRAB_CACHE_DIR,
         config.FFMPEG_PATH,
     )
+    stale_prescan = prescan.reset_stale_running(config.GRAB_CACHE_DIR)
+    if stale_prescan:
+        logger.warning("Reset %d stale running prescan state(s) to failed", stale_prescan)
     sweeper.start()
     try:
         yield
@@ -119,6 +124,10 @@ app.add_middleware(CORSMiddleware, **_cors_kwargs)
 # 内置媒体库 / 播放器（与 /hls 共用同一个 hls_cache 实例）
 webui.bind(hls_cache)
 app.include_router(webui.router)
+
+# 离线人脸关键点预扫 API 与二进制表下载
+prescan_api.bind(hls_cache)
+app.include_router(prescan_api.router)
 
 
 @app.middleware("http")
