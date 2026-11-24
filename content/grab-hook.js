@@ -13,17 +13,14 @@
   window.__RB_GRAB_HOOK__ = true;
 
   // ---------------------------------------------------------------------
-  // 域名白名单 —— 只接管目标站的 m3u8，绝不碰正规站
-  // 注意：javrate 的播放器在 iframe 里（www.javrate.com），主站在 javrate.com，
-  //       CDN 在 avking.xyz / surrit.com / 52cute.com，都要覆盖。
+  // 全站可用，但**默认不缓存**：是否接管由用户的「本站缓存」开关决定
+  // （rbCacheHosts，按域名记忆，见 grab-relay.js）。
+  // 唯一硬排除：走 v2 MSE 方案的 B站 / YouTube，它们由 cache-hook.js 负责。
   // ---------------------------------------------------------------------
-  const ALLOW_HOST = /(^|\.)(missav\.[a-z]+|javrate\.[a-z]+|avbebe\.[a-z]+|52cute\.com|avking\.xyz|surrit\.com)$/i;
   try {
     const h = (window.location.hostname || "").toLowerCase();
-    if (!ALLOW_HOST.test(h)) return;
-  } catch (_) {
-    return;
-  }
+    if (h.endsWith("bilibili.com") || h.endsWith("youtube.com")) return;
+  } catch (_) {}
 
   const LOCAL_ORIGIN = "http://127.0.0.1:8765";
   const SESSION_KEY = "rb_v3_state";
@@ -33,8 +30,12 @@
   let pageUrl = window.location.href;
   let LOCAL_KEYS = new Set();
   let serverOnline = false;
+  // 缓存开关（按域名，用户自己开）。false 时完全不改写 m3u8 = 不落盘。
+  let cacheEnabled = false;
+  // 已经 patch 过的 hls.js 实例，用于「中途开关」时热切换
+  const LIVE_PLAYERS = [];
 
-  const STATS = { rewritten: 0, v3Hit: 0, skippedOffline: 0 };
+  const STATS = { rewritten: 0, v3Hit: 0, skippedOffline: 0, skippedNoCache: 0 };
 
   // =========================================================================
   // 状态同步（来自 ISOLATED world 的 grab-relay.js）
@@ -45,6 +46,12 @@
     if (typeof state.pageUrl === "string" && state.pageUrl) pageUrl = state.pageUrl;
     if (Array.isArray(state.keys)) LOCAL_KEYS = new Set(state.keys);
     if (typeof state.serverOnline === "boolean") serverOnline = state.serverOnline;
+    if (typeof state.cacheEnabled === "boolean") {
+      const wasOff = !cacheEnabled;
+      cacheEnabled = state.cacheEnabled;
+      // 用户中途打开开关：把正在播的 hls.js 实例热切到本地代理，不用刷新页面
+      if (wasOff && cacheEnabled) reapplyLivePlayers();
+    }
     // 状态同步后如果已有主播放器，尝试升级到 v3 整片
     if (queryV3Local()) upgradeExistingMainVideo();
   }
@@ -98,6 +105,11 @@
       STATS.skippedOffline += 1;
       return mediaUrl;
     }
+    // 用户没为这个站点开启缓存 —— 原样返回，不产生任何落盘
+    if (!cacheEnabled) {
+      STATS.skippedNoCache += 1;
+      return mediaUrl;
+    }
     const sk = currentSafeKey();
     if (!sk) return mediaUrl;
     const src = b64e(mediaUrl);
@@ -111,6 +123,38 @@
     return local;
   }
 
+  /** 开关从关到开时，把正在播的实例热切到本地代理（不刷新页面、不丢进度） */
+  function reapplyLivePlayers() {
+    for (const hls of LIVE_PLAYERS.slice()) {
+      try {
+        const orig = hls.__rbOrigSrc;
+        if (!orig) continue;
+        if (isLocal(String(hls.url || ""))) continue;
+        const local = toLocalPlaylist(orig);
+        if (!local || local === orig) continue;
+        const media = hls.media || null;
+        const pos = media ? media.currentTime : 0;
+        const wasPlaying = media ? !media.paused : false;
+        hls.loadSource(local);
+        if (media) {
+          if (pos > 0) {
+            try {
+              media.currentTime = pos;
+            } catch (_) {}
+          }
+          if (wasPlaying) {
+            try {
+              media.play().catch(() => {});
+            } catch (_) {}
+          }
+        }
+        console.log("[rb-hls][hot-enable] ->", local);
+      } catch (err) {
+        console.warn("[rb-hls][hot-enable] failed", err);
+      }
+    }
+  }
+
   function isLocal(u) {
     return typeof u === "string" && u.startsWith(LOCAL_ORIGIN);
   }
@@ -118,6 +162,27 @@
   // =========================================================================
   // Hook 1: hls.js（主入口）
   // =========================================================================
+  function patchHlsProto(proto) {
+    if (!proto || typeof proto.loadSource !== "function" || proto.__rbPatched) return;
+    proto.__rbPatched = true;
+    const origLoad = proto.loadSource;
+    proto.loadSource = function (url) {
+      const s = String(url || "");
+      let next = url;
+      try {
+        if (s && M3U8_RE.test(s) && !isLocal(s)) {
+          // 记住原始地址：即使此刻缓存是关的，用户中途打开也能热切过去
+          this.__rbOrigSrc = s;
+          next = toLocalPlaylist(s);
+        }
+      } catch (_) {}
+      try {
+        if (LIVE_PLAYERS.indexOf(this) < 0) LIVE_PLAYERS.push(this);
+      } catch (_) {}
+      return origLoad.call(this, next);
+    };
+  }
+
   let _HlsRef = null;
   try {
     Object.defineProperty(window, "Hls", {
@@ -129,18 +194,7 @@
       set(v) {
         _HlsRef = v;
         try {
-          const proto = v && v.prototype;
-          if (!proto || typeof proto.loadSource !== "function" || proto.__rbPatched) return;
-          proto.__rbPatched = true;
-          const origLoad = proto.loadSource;
-          proto.loadSource = function (url) {
-            let next = url;
-            try {
-              const s = String(url || "");
-              if (s && !isLocal(s) && M3U8_RE.test(s)) next = toLocalPlaylist(s);
-            } catch (_) {}
-            return origLoad.call(this, next);
-          };
+          patchHlsProto(v && v.prototype);
         } catch (_) {}
       },
     });
@@ -149,19 +203,7 @@
   // hls.js 若在本脚本之前已加载，补一次 patch
   if (window.Hls) {
     try {
-      const proto = window.Hls.prototype;
-      if (proto && typeof proto.loadSource === "function" && !proto.__rbPatched) {
-        proto.__rbPatched = true;
-        const origLoad = proto.loadSource;
-        proto.loadSource = function (url) {
-          let next = url;
-          try {
-            const s = String(url || "");
-            if (s && !isLocal(s) && M3U8_RE.test(s)) next = toLocalPlaylist(s);
-          } catch (_) {}
-          return origLoad.call(this, next);
-        };
-      }
+      patchHlsProto(window.Hls.prototype);
     } catch (_) {}
   }
 
@@ -318,6 +360,7 @@
     getSafeKey: () => currentSafeKey(),
     getKeys: () => Array.from(LOCAL_KEYS),
     isServerOnline: () => serverOnline,
+    isCacheEnabled: () => cacheEnabled,
     getStats: () => ({ ...STATS }),
     toLocalPlaylist,
     setSyncState: applySyncState,

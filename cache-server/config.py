@@ -71,6 +71,19 @@ HLS_FETCH_TIMEOUT: int = int(os.environ.get("RB_HLS_TIMEOUT", "30"))
 # 首选清晰度上限：选 <= 它的最高档；0 表示直接用最高档
 HLS_PREFERRED_HEIGHT: int = int(os.environ.get("RB_HLS_PREFERRED_HEIGHT", "720"))
 
+# ---------------------------------------------------------------------------
+# 缓存自动清理（按「多久没看」+「总量超限」两条规则）
+# ---------------------------------------------------------------------------
+CACHE_SWEEP_ENABLED: bool = os.environ.get("RB_CACHE_SWEEP", "true").lower() == "true"
+# 超过这么多天没访问过的条目自动删；0 = 不限
+CACHE_MAX_AGE_DAYS: int = int(os.environ.get("RB_CACHE_MAX_AGE_DAYS", "7"))
+# 缓存总量上限（GB）；0 = 不限。超了就按「最久没看」从旧到新删
+CACHE_MAX_GB: float = float(os.environ.get("RB_CACHE_MAX_GB", "20"))
+# 巡检间隔（分钟）
+CACHE_SWEEP_INTERVAL_MIN: int = int(os.environ.get("RB_CACHE_SWEEP_INTERVAL_MIN", "60"))
+# 服务启动后多久跑第一次（秒），避开启动瞬间的 IO
+CACHE_SWEEP_FIRST_DELAY_SEC: int = int(os.environ.get("RB_CACHE_SWEEP_FIRST_DELAY", "45"))
+
 FFMPEG_PATH: str = _resolve_binary("RB_FFMPEG_PATH", "ffmpeg")
 FFPROBE_PATH: str = _resolve_binary("RB_FFPROBE_PATH", "ffprobe")
 

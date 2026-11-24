@@ -91,6 +91,25 @@ button {
 
 .lib-actions { display: flex; gap: 10px; align-items: center; }
 
+/* 清理规则条 */
+.sweep-bar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin: -6px 0 22px;
+  padding: 11px 15px;
+  border-radius: 10px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  font-size: 12.5px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.sweep-bar b { color: var(--text); font-weight: 600; }
+.sweep-bar .hot { color: var(--warn); }
+
 .btn {
   display: inline-flex;
   align-items: center;

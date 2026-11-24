@@ -28,6 +28,8 @@
 > 2. 那三个目标站播放器简陋，**在原页面里**套我们自己的控制条，**不要跳到 127.0.0.1 单开网页**。
 > 3. 本地媒体库页只作为兜底入口存在，不是主交互路径。
 > 4. 控制条**不做站点硬限制**：全站注入，谁能用由用户开关决定，按域名记忆。
+> 5. 缓存**也不做站点硬限制、也不自动全存**：默认全关，用户自己在面板里选哪些站要缓存。
+> 6. 缓存要能**定时自动清理**（按天数 + 按容量），别把硬盘塞满。
 
 ---
 
@@ -35,11 +37,12 @@
 
 ```
 ✅ 美颜引擎         26 项效果、7 档预设、中文配方解析、XGPlayer/Plyr/B站/YouTube 适配（全站）
-✅ 本地缓存服务     FastAPI，curl_cffi 传输，ffmpeg 合并，LRU 清理
+✅ 本地缓存服务     FastAPI，curl_cffi 传输，ffmpeg 合并
 ✅ v4 透明缓存      三家站点实测跑通（边看边存，零额外流量）
+✅ 缓存按站开关     默认全关，用户在面板里自行开启某站，按域名记忆，可中途热切
+✅ 缓存自动清理     保留 N 天 + 总容量上限，后台巡检，媒体库可手动立刻清
 ✅ 原站控制条       player-bar.js：在任意站点原视频上套自制控制条，按域名开关，不跳页
-✅ 域名白名单       grab-hook 只注入三家站点；player-bar 全站注入但默认只在三家开
-✅ 本地媒体库       GET / 列出已缓存视频（缩略图/进度/删除），离线兜底用
+✅ 本地媒体库       GET / 列出已缓存视频（缩略图/进度/删除/清理规则），离线兜底用
 ⬜ 关键点预扫       未开始（原始设计文档的核心目标，见 7.3）
 ```
 
@@ -62,8 +65,9 @@
 ```
 ┌──────── 页面 (MAIN world, all_frames) ────────┐
 │ grab-hook.js                                    │
-│   域名白名单过滤 → 拦截 window.Hls 的赋值       │
-│   把 m3u8 URL 改写成 127.0.0.1 本地代理         │
+│   ① 域名开关过滤（rbCacheHosts，默认关）        │
+│   ② 拦截 window.Hls 的赋值 → patch loadSource   │
+│   ③ 把 m3u8 URL 改写成 127.0.0.1 本地代理       │
 └────────────────┬───────────────────────────────┘
                  │ 播放器请求本地 m3u8
 ┌────────────────▼───────────────────────────────┐
@@ -142,6 +146,41 @@ API：`window.RBPlayerBar.setEnabled(bool)` / `isEnabled()` / `refresh()` / `rea
 
 改配置后**实时生效**，不用刷新页面。
 
+### 3.5 缓存开关与自动清理（**2026-11-24 新增**）
+
+#### 缓存不再是"全都存"，改成用户自己选
+
+`grab-hook.js` **全站注入**，但默认**不改写任何 m3u8**。是否接管由用户的「本站缓存」开关决定，配置在 `chrome.storage.local` 的 `rbCacheHosts`：
+
+```json
+{ "missav.ws": true, "www.douyin.com": false }
+```
+
+- **没有条目的域名 = 不缓存**（默认全关，安全）
+- 开关位置：美颜面板 →「当前视频」卡片 →「本站缓存 ⟷ <域名>」
+- 面板下方会实时显示当前视频的缓存进度（`已缓存 130/374 片 · 35%`）
+- 开关从关变开时，`grab-hook` 会把**正在播的 hls.js 实例热切**到本地代理（`reapplyLivePlayers`），保存 `currentTime` 与播放状态，**不用刷新页面**
+- 唯一硬排除：B站 / YouTube（走 v2 的 `cache-hook.js`，不归这套管）
+
+链路：`grab-relay.js`（ISOLATED，能读 chrome.storage）→ `sessionStorage` + `postMessage` → `grab-hook.js`（MAIN）读 `cacheEnabled`。
+
+#### 自动清理
+
+后台线程 `maintenance.CacheSweeper`，两条规则同时生效：
+
+| 规则 | 默认 | 行为 |
+|---|---|---|
+| **保留天数** | 7 天 | `meta.lastAccessAt` 超过 7 天 → 删 |
+| **容量上限** | 20 GB | 总量超限 → 按「最久没看」从旧到新删，直到降下来 |
+
+- 巡检间隔 60 分钟，服务启动后延迟 45 秒跑第一次
+- **删除一律走 `hls_cache.delete_video()`**（内含三层兜底），绝不直接 `rmtree`
+- 巡检线程 `except BaseException` 全吞，清理失败不影响播放
+- 媒体库页顶部显示规则与占用，带「立即清理」按钮
+- `POST /api/maintenance/sweep?dry_run=true` 可以只看会删什么
+
+用 `meta.lastAccessAt` 而不是目录 mtime 的原因：读分片会刷新 `lastAccessAt`，能真实反映"最近有没有看"；mtime 只在写文件时变。
+
 ---
 
 ## 4. 代码地图
@@ -165,8 +204,9 @@ API：`window.RBPlayerBar.setEnabled(bool)` / `isEnabled()` / `refresh()` / `rea
 | 文件 | 行数 | 职责 |
 |---|---|---|
 | `cache-server/webui.py` | ~470 | **新增**。媒体库 + 播放器 + 本地 playlist + 静态资源 + 缩略图 |
+| `cache-server/maintenance.py` | ~250 | **新增**。后台巡检：按天数和容量两条规则清理缓存 |
 | `cache-server/hls_proxy.py` | ~570 | **v4 核心**。透明缓存全部逻辑 |
-| `cache-server/server.py` | ~440 | FastAPI 路由（v2 + v3 + v4 + webui 全挂在这） |
+| `cache-server/server.py` | ~470 | FastAPI 路由（v2 + v3 + v4 + webui + maintenance 全挂在这） |
 | `cache-server/config.py` | ~85 | 所有配置项 |
 | `cache-server/grab_pipeline.py` | 1368 | v3 整片下载管道（curl_cffi + ffmpeg） |
 | `cache-server/storage.py` | 598 | v2 稀疏文件存储 |
@@ -335,24 +375,36 @@ MissAV 720p：
 
 验证记录：150 片目录删除 → `rmtree aborted by environment guard (SystemExit: 1)` → `force delete ok` → 服务全程存活，`/health` 一直 200。
 
+### 6.7 缓存开关与清理的实测（2026-11-24）
+
+```
+缓存开关：
+  默认（无配置）        cacheEnabled=false → toLocalPlaylist 原样返回，落盘 0 片
+  面板开启后            正在播的 hls.js 热切到本地代理，进度保留，无需刷新
+  配置持久化            chrome.storage.local 的 rbCacheHosts，按域名
+
+自动清理：
+  过期条目（10 天前）   dry-run planned=1 → 真清理 removed=[(oldtest-expired-entry, expired)]
+  容量规则（上限 1MB）  69.8MB 条目 planned=1，reason=over-quota
+  清理后服务            /health 仍 200，avbebe 缓存（最近访问过）未被误删
+```
+
+**注意**：测试时造过 `_oldtest_expired` 目录，因为 `_` 前缀被 `scan()` 当成 `_trash` 跳过，dry-run 显示 `planned: 0`，误以为清理没生效。写测试数据不要用 `_` 开头。
+
 ---
 
 ## 7. 未完成 / 下一步
 
-### 7.1 ~~域名白名单~~ ✅ 已完成（2026-11-24）
+### 7.1 域名白名单 → 已演进为「按站点开关」
 
-`content/grab-hook.js` 开头加了 host 白名单：
+最初用硬编码白名单（`ALLOW_HOST` 正则 + manifest matches 收窄）限制在三家站点。后来按用户要求改成**用户自己选**：
 
-```js
-const ALLOW_HOST = /(^|\.)(missav\.[a-z]+|javrate\.[a-z]+|avbebe\.[a-z]+|52cute\.com|avking\.xyz|surrit\.com)$/i;
-if (!ALLOW_HOST.test(location.hostname)) return;
-```
+- `grab-hook` / `grab-relay` / `player-bar` 全部**全站注入**
+- 是否接管由 `chrome.storage.local` 里的按域名开关决定
+- 缓存（`rbCacheHosts`）**默认全关**，播放器控制条（`rbpPlayerBarHosts`）三站默认开
+- 唯一硬排除仍然是 B站 / YouTube 的缓存（走 v2 的 `cache-hook.js`）
 
-`manifest.json` 的 `grab-hook` / `grab-relay` matches 也从 `<all_urls>` 收窄到三家站点。
-
-已用 18 条用例验证：`www.javrate.com` 通过（iframe host），`missav.ws.evil.com` 被拒（后缀伪造），`bilibili.com` / `iqiyi.com` / `v.qq.com` 全部跳过。
-
-**注意**：`content/engine.js` + `overlay-ui.js` 仍是 `<all_urls>`（美颜是全站能力，故意保留）。
+这样既不影响正规站（默认不动），又允许用户在任何站启用。
 
 ### 7.2 本地媒体库 + 独立播放器页（已完成，定位为**离线兜底**）
 
@@ -530,6 +582,20 @@ RB_HLS_PREFETCH=3               # 预取片数，>3 退化成整片下载
 RB_HLS_MAX_FETCH=4              # 全局并发，别超 8
 RB_HLS_PROXY=false              # 关掉透明缓存，回到 v3
 RB_GRAB_IMPERSONATE=chrome      # curl_cffi 指纹
+
+# 自动清理
+RB_CACHE_SWEEP=true             # 总开关
+RB_CACHE_MAX_AGE_DAYS=7         # 超过这么多天没访问就删；0=不限
+RB_CACHE_MAX_GB=20              # 总量上限 GB，超了按最久没看删；0=不限
+RB_CACHE_SWEEP_INTERVAL_MIN=60  # 巡检间隔（分钟）
+RB_CACHE_SWEEP_FIRST_DELAY=45   # 启动后多久跑第一次（秒）
+```
+
+前端开关（存 `chrome.storage.local`，不走环境变量）：
+
+```
+rbCacheHosts    { "missav.ws": true }   本站缓存，无条目=不缓存
+rbpPlayerBarHosts { "missav.ws": true } 播放器控制条，无条目=三站默认开
 ```
 
 ---
@@ -550,6 +616,9 @@ RB_GRAB_IMPERSONATE=chrome      # curl_cffi 指纹
 12. **控制条只能操作 `<video>` 标准 API** —— 不要碰具体播放器框架的内部状态；全屏要请求**容器**，请求 `<video>` 会让 engine 回退原生、美颜消失
 13. **抖音 / B站 / YouTube 默认不要接管控制条** —— 用户明确要求保留它们自带的播放器。控制条改成「全站注入 + 按域名开关」，这些站默认关，用户自己开了才生效
 14. **本地播放器页的脚本顺序：`hls.min.js → shim.js → player-bar.js → engine.js → overlay-ui.js`** —— `player-bar` 必须在 `shim` **之后**，否则它读配置时走无前缀 localStorage、写配置时走 shim 的 `rbp:` 前缀，读写键不一致，开关状态刷新就丢
+15. **`grab-hook.js` 在 MAIN world，读不到 `chrome.storage`** —— 任何配置都必须由 `grab-relay.js`（ISOLATED）读好，再经 `sessionStorage` + `postMessage` 传进去。别在 hook 里直接调 chrome API
+16. **自动清理只能走 `hls_cache.delete_video()`** —— 里面有三层兜底；自己写 `rmtree` 会重蹈「DELETE 打死服务」的覆辙
+17. **缓存目录里 `_` 开头的目录不参与扫描** —— 那是删除失败时的 `_trash` 兜底位。写测试数据时别用 `_` 开头，否则会被当成 trash 跳过（踩过一次）
 
 ---
 

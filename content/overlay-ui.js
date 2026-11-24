@@ -794,6 +794,14 @@
               <span class="slider"></span>
             </label>
           </div>
+          <div class="row-between" id="cacheToggleRow" style="margin-top:9px">
+            <span class="label">本站缓存 <span id="cacheHostHint" class="hint-muted"></span></span>
+            <label class="switch" title="把本站视频分片缓存到本地磁盘（按域名记忆）。关闭=完全不接管">
+              <input type="checkbox" id="toggleSiteCache" />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div id="cacheInfo" class="meta" style="margin-top:6px;display:none"></div>
         </section>
 
         <section class="card">
@@ -916,6 +924,10 @@
       barToggleRow: $("barToggleRow"),
       togglePlayerBar: $("togglePlayerBar"),
       barHostHint: $("barHostHint"),
+      cacheToggleRow: $("cacheToggleRow"),
+      toggleSiteCache: $("toggleSiteCache"),
+      cacheHostHint: $("cacheHostHint"),
+      cacheInfo: $("cacheInfo"),
       presetBar: $("presetBar"),
       activePresetLabel: $("activePresetLabel"),
       skinSliders: $("skinSliders"),
@@ -1322,6 +1334,107 @@
       });
       // 面板每次打开时对齐一次（可能被别的标签页改过）
       window.__WVB_BAR_SYNC__ = sync;
+    })();
+
+    // 本站缓存开关 —— 按域名记忆，默认关；开了才会把分片落到磁盘
+    (function setupCacheToggle() {
+      const cb = els.toggleSiteCache;
+      if (!cb || !els.cacheToggleRow) return;
+      const KEY = "rbCacheHosts";
+      const host = (function () {
+        try {
+          return (location.hostname || "").toLowerCase();
+        } catch (_) {
+          return "";
+        }
+      })();
+      if (els.cacheHostHint) els.cacheHostHint.textContent = host;
+
+      const canStore =
+        typeof chrome !== "undefined" && chrome.storage && chrome.storage.local;
+
+      const readMap = () =>
+        new Promise((resolve) => {
+          if (!canStore) {
+            resolve({});
+            return;
+          }
+          try {
+            chrome.storage.local.get({ [KEY]: {} }, (res) => {
+              const v = res && res[KEY];
+              resolve(v && typeof v === "object" ? v : {});
+            });
+          } catch (_) {
+            resolve({});
+          }
+        });
+
+      const writeMap = (map) =>
+        new Promise((resolve) => {
+          if (!canStore) {
+            resolve();
+            return;
+          }
+          try {
+            chrome.storage.local.set({ [KEY]: map }, () => {
+              void chrome.runtime.lastError;
+              resolve();
+            });
+          } catch (_) {
+            resolve();
+          }
+        });
+
+      const sync = () =>
+        readMap().then((map) => {
+          cb.checked = Object.prototype.hasOwnProperty.call(map, host)
+            ? !!map[host]
+            : false;
+        });
+
+      sync();
+
+      cb.addEventListener("change", async () => {
+        const map = await readMap();
+        map[host] = !!cb.checked;
+        await writeMap(map);
+      });
+
+      // 显示当前视频已缓存多少（能拿到本地服务才有意义）
+      if (els.cacheInfo) {
+        const tick = async () => {
+          if (!cb.checked) {
+            els.cacheInfo.style.display = "none";
+            return;
+          }
+          const dbg = window.__RB_HLS_DEBUG__;
+          const sk = dbg && dbg.getSafeKey ? dbg.getSafeKey() : "";
+          if (!sk) return;
+          try {
+            const r = await fetch(
+              `http://127.0.0.1:8765/api/video/${encodeURIComponent(sk)}`,
+              { cache: "no-store" }
+            );
+            if (!r.ok) throw new Error("bad");
+            const d = await r.json();
+            if (!d || !d.exists) {
+              els.cacheInfo.style.display = "";
+              els.cacheInfo.textContent = "本地还没有这条视频的分片";
+              return;
+            }
+            const total = d.totalSegments || 0;
+            const cached = d.cachedSegments || 0;
+            const pct = total ? Math.round((cached / total) * 100) : 0;
+            els.cacheInfo.style.display = "";
+            els.cacheInfo.textContent = `已缓存 ${cached}/${total} 片 · ${pct}%`;
+          } catch (_) {
+            els.cacheInfo.style.display = "";
+            els.cacheInfo.textContent = "本地服务未启动，缓存不可用";
+          }
+        };
+        tick();
+        setInterval(tick, 4000);
+      }
     })();
 
     // Tabs

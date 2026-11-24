@@ -16,13 +16,42 @@
   } catch (_) {}
 
   const SESSION_KEY = "rb_v3_state";
+  // 缓存开关：按域名记忆，{ "missav.ws": true, ... }。没有条目 = 不缓存。
+  const CACHE_HOSTS_KEY = "rbCacheHosts";
+
   let lastPageKey = null;
   let lastPageUrl = null;
   let lastKeys = [];
   let lastOnline = false;
+  let lastCacheEnabled = false;
 
   function canUseRuntime() {
     return typeof chrome !== "undefined" && chrome.runtime && typeof chrome.runtime.sendMessage === "function";
+  }
+
+  function resolveCacheEnabled(hosts) {
+    const map = hosts && typeof hosts === "object" ? hosts : {};
+    const h = (window.location.hostname || "").toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(map, h)) return !!map[h];
+    return false; // 默认不缓存，由用户自己开
+  }
+
+  function readCachePref(cb) {
+    try {
+      if (typeof chrome !== "undefined" && chrome.storage && chrome.storage.local) {
+        chrome.storage.local.get({ [CACHE_HOSTS_KEY]: {} }, (res) => {
+          if (chrome.runtime.lastError) {
+            if (cb) cb();
+            return;
+          }
+          const map = (res && res[CACHE_HOSTS_KEY]) || {};
+          lastCacheEnabled = resolveCacheEnabled(map);
+          if (cb) cb();
+        });
+        return;
+      }
+    } catch (_) {}
+    if (cb) cb();
   }
 
   function pushStateToMain(pageKey, pageUrl, keys, serverOnline) {
@@ -36,6 +65,7 @@
       pageUrl: lastPageUrl,
       keys: lastKeys,
       serverOnline: lastOnline,
+      cacheEnabled: lastCacheEnabled,
     };
     try {
       sessionStorage.setItem(SESSION_KEY, JSON.stringify(state));
@@ -68,6 +98,12 @@
   try {
     if (typeof chrome !== "undefined" && chrome.storage && chrome.storage.onChanged) {
       chrome.storage.onChanged.addListener((changes, area) => {
+        // 面板里切换「本站缓存」后立刻同步给 MAIN，不用刷新页面
+        if (area === "local" && changes[CACHE_HOSTS_KEY]) {
+          lastCacheEnabled = resolveCacheEnabled(changes[CACHE_HOSTS_KEY].newValue);
+          pushStateToMain(null, null, null, null);
+          return;
+        }
         if (area !== "session") return;
         const nextKeys = changes.rbKeys ? changes.rbKeys.newValue : lastKeys;
         const nextOnline = changes.rbServerOnline ? changes.rbServerOnline.newValue : lastOnline;
@@ -85,7 +121,7 @@
     if (!data || typeof data !== "object") return;
 
     if (data.__rbGrab === "request-sync") {
-      requestInitFromSw();
+      readCachePref(() => requestInitFromSw());
       return;
     }
 
@@ -135,6 +171,6 @@
     }
   });
 
-  // Fetch initial top-level pageKey & cached keys immediately at document_start
-  requestInitFromSw();
+  // 先读缓存开关，再拉 SW 状态：保证第一次同步就带正确的 cacheEnabled
+  readCachePref(() => requestInitFromSw());
 })();

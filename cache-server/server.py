@@ -20,6 +20,7 @@ import webui
 from grab_models import GrabRequest, GrabResponse
 from grab_pipeline import GrabManager
 from hls_proxy import TransparentHlsCache, b64d, safe_key_of
+from maintenance import CacheSweeper
 from models import (
     EnqueueRequest,
     EnqueueResponse,
@@ -50,6 +51,9 @@ grab_manager = GrabManager()
 
 # v4 transparent HLS cache (segment-level on-demand caching)
 hls_cache = TransparentHlsCache()
+
+# 定时清理（按「多久没看」+「总量超限」两条规则）
+sweeper = CacheSweeper(hls_cache)
 
 # Preserved v2 sparse-range store (kept intact, no longer extended per v3 spec)
 storage = VideoCacheStorage(config.CACHE_DIR)
@@ -90,10 +94,12 @@ async def lifespan(_app: FastAPI):
         config.GRAB_CACHE_DIR,
         config.FFMPEG_PATH,
     )
+    sweeper.start()
     try:
         yield
     finally:
         logger.info("Shutting down cache server...")
+        sweeper.stop()
         grab_manager.close()
         hls_cache.close()
         if downloader is not None:
@@ -345,6 +351,20 @@ def get_stats(scope: str = Query("v3")) -> dict:
     st = grab_manager.get_stats()
     st["hls"] = dict(hls_cache.stats)
     return st
+
+
+# ===========================================================================
+# 缓存自动清理
+# ===========================================================================
+@app.get("/api/maintenance")
+def maintenance_status() -> dict:
+    return sweeper.status()
+
+
+@app.post("/api/maintenance/sweep")
+def maintenance_sweep(dry_run: bool = Query(False)) -> dict:
+    """立即跑一次清理。dry_run=true 只报告会删什么，不动手。"""
+    return sweeper.sweep(dry_run=dry_run)
 
 
 # ===========================================================================

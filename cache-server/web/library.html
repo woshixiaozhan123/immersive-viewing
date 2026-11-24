@@ -15,9 +15,11 @@
       <p class="lib-sub" id="sub">正在读取缓存…</p>
     </div>
     <div class="lib-actions">
+      <button class="btn ghost" id="btn-sweep" title="按规则立刻清理一次">立即清理</button>
       <button class="btn ghost" id="btn-refresh">刷新</button>
     </div>
   </div>
+  <div class="sweep-bar" id="sweep-bar">正在读取清理规则…</div>
   <div class="grid" id="grid"></div>
 </div>
 
@@ -141,8 +143,62 @@
     }
   });
 
-  btnRefresh.addEventListener("click", load);
+  // ---- 清理规则 -----------------------------------------------------------
+  const sweepBar = document.getElementById("sweep-bar");
+  const btnSweep = document.getElementById("btn-sweep");
+
+  async function loadMaintenance() {
+    let d;
+    try {
+      const r = await fetch("/api/maintenance", { cache: "no-store" });
+      d = await r.json();
+    } catch (_) {
+      sweepBar.textContent = "读取清理规则失败：本地服务没有响应。";
+      return;
+    }
+    const rl = d.rules || {};
+    const age = rl.maxAgeDays > 0 ? `保留 <b>${rl.maxAgeDays}</b> 天` : "不限天数";
+    const cap = rl.maxGB > 0 ? `上限 <b>${rl.maxGB} GB</b>` : "不限容量";
+    const usage = d.limitGB > 0
+      ? `当前 <b>${d.totalGB} GB</b> / ${d.limitGB} GB（${d.usagePct}%）`
+      : `当前 <b>${d.totalGB} GB</b>`;
+    const hot = d.limitGB > 0 && d.usagePct >= 90 ? " hot" : "";
+    const every = d.enabled
+      ? `每 <b>${rl.intervalMin}</b> 分钟自动巡检`
+      : '<span class="hot">自动清理已关闭</span>';
+    const last = d.lastRunAt
+      ? `上次清理 ${new Date(d.lastRunAt).toLocaleString("zh-CN", { hour12: false })}`
+      : "还没跑过清理";
+    sweepBar.innerHTML = `<span>${age} · ${cap} · <span class="${hot.trim()}">${usage}</span></span>`
+      + `<span>${every}</span><span>${last}</span>`;
+  }
+
+  btnSweep.addEventListener("click", async () => {
+    btnSweep.disabled = true;
+    btnSweep.textContent = "清理中…";
+    try {
+      const r = await fetch("/api/maintenance/sweep", { method: "POST" });
+      const d = await r.json();
+      const n = (d.removed || []).length;
+      const failed = (d.failed || []).length;
+      let msg = n
+        ? `清理完成：删除 ${n} 个视频，释放 ${d.freedGB} GB`
+        : "清理完成：没有需要删除的内容";
+      if (failed) msg += `（${failed} 个删除失败）`;
+      sweepBar.innerHTML = `<span>${esc(msg)}</span>`;
+      await load();
+      await loadMaintenance();
+    } catch (err) {
+      sweepBar.textContent = "清理失败：本地服务没有响应。";
+    } finally {
+      btnSweep.disabled = false;
+      btnSweep.textContent = "立即清理";
+    }
+  });
+
+  btnRefresh.addEventListener("click", () => { load(); loadMaintenance(); });
   load();
+  loadMaintenance();
 })();
 </script>
 </body>
