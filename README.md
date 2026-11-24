@@ -5,24 +5,26 @@
 [![Manifest V3](https://img.shields.io/badge/Manifest-V3-38bdf8?style=flat-square)](#)
 [![iOS Safari Userscript](https://img.shields.io/badge/iOS-Safari%20Userscript-a855f7?style=flat-square)](#ios-safari-安装与横屏全屏)
 [![WebGL + MediaPipe](https://img.shields.io/badge/Engine-WebGL%20%2B%20MediaPipe%20478-ec4899?style=flat-square)](#)
+[![Changelog](https://img.shields.io/badge/Changelog-更新日志-f59e0b?style=flat-square)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-10b981?style=flat-square)](LICENSE)
 
 ---
 
 ## 核心特性
 
-- **100% 本机离线推理与渲染**：所有视频帧与人脸关键点均在用户浏览器本地处理，零远端 API、零数据上报。
-- **可选：视频本地缓存 + 内置播放器**（见下方「本地缓存与内置播放器」）：边看边把分片落到本地磁盘，之后用 `http://127.0.0.1:8765/` 打开自带播放器回看，**原站关掉、token 过期都不影响**，美颜面板一模一样地保留。
-- **最小权限 & 按需注入**：美颜引擎申请 `activeTab`、`scripting`、`storage`，未点击扩展图标时不注入页面代码；透明缓存模块（`grab-hook`）只在 MissAV / Javrate / Avbebe 三个域名注入，**不碰其它站点**。
+- **100% 本机离线推理与渲染**：所有视频帧、人脸关键点与发丝分割均在用户本机处理，零远端 API、零数据上报。
+- **可选：视频本地缓存 + 离线预扫防掉妆 + 内置播放器**（见下方「本地缓存与内置播放器」）：边看边把分片落到本地磁盘，支持对已缓存分片离线预扫人脸关键点（`prescan`）并在回看时查表兜底、显著减少侧脸/模糊/远景掉妆；打开 `http://127.0.0.1:8765/` 即可回看，**原站关掉、token 过期都不影响**，完整保留 26 项美颜面板。
+- **最小权限 & 按域名显式开关**：美颜面板与控制条可按需交互，透明 HLS 缓存模块（`grab-hook`）与原站自制控制条（`player-bar`）**默认关闭**，由用户在美颜面板中按站点手动开关与即时热切（B 站 / YouTube 单独由 `cache-hook` 处理 MSE 流）。
 - **Wink / 剪映专业级 26 项分项美颜（单 Pass WebGL 管线）**：
   - **美肤（7 项）**：磨皮（12-tap 保边双边近似）、质感保留（高频肤质细节还原，避免塑料脸）、美白（高光保护冷白提亮）、红润（苹果肌暖色提气色）、去黑眼圈、淡法令纹、去油光（T 区高光柔化）。
   - **美型（8 项）**：瘦脸（下颌线收窄）、窄颧骨、下巴长短（`-50 ~ +50` 双向精调）、大眼、眼尾上扬（`-50 ~ +50` 双向精调）、瘦鼻、嘴型大小（`-50 ~ +50` 双向精调）、微笑唇；内置纵横比校正与侧脸对称度 `yawFactor` 自动衰减，避免侧脸背景拉扯。
   - **美妆（5 项）**：亮眼、立体修容（鼻影 + 下颌微阴影）、润唇口红 + **4 款唇色风格**（裸粉 / 蜜桃橘 / 玫瑰豆沙 / 复古正红）、牙齿美白。
   - **调色（6 项）**：清晰锐化（眼唇细节保边增强）、亮度曝光（`-50 ~ +50`）、对比度（`-50 ~ +50`）、饱和度（`-50 ~ +50`）、色温冷暖（`-50 ~ +50`）、氛围柔光（Orton 风格高光漫射）；全画幅调色在无脸或降级回退场景下同样生效。
   - **预设与方案管理**：内置 7 档风格预设（自然清透 / 冷白质感 / 日系柔光 / 纯欲微调 / 网感精修 / 减龄打底 / 归零）、本地「我的方案」保存、参数 JSON 导入导出与 **Wink/小红书中文配方文本一键解析**（直接粘贴 `小脸+20 眼睛倾斜-29 鼻子大小+34 口红/豆沙+18 饱和度-20 色温-8` 即可自动识别并跳过非面部项），双击任意滑块可单项归零。
-- **双频解耦 & 丝滑防抖**：
-  - 渲染主循环跟随视频帧（`requestVideoFrameCallback`，自动回退 `requestAnimationFrame`）；
-  - 人脸追踪运行在独立 Module Web Worker（CPU XNNPACK / WASM SIMD，把 GPU 留给渲染与视频硬解），配合主脸 IoU 锁定、One-Euro 滤波与 ≤120ms 速度外推。
+- **零滞后帧同步 + 独立发丝分割**：
+  - 渲染主循环通过 `VideoFrame` 原子锁帧匹配对应视频帧（0.00ms 音画脸型滞后），由 `requestVideoFrameCallback`（自动回退 `requestAnimationFrame`）驱动；
+  - 独立 `face-worker.js`（GPU Delegate 优先、CPU XNNPACK 回退）结合主脸 IoU 锁定、运动自适应死区稳定器与 `448–512px` 小脸动态高倍 ROI 裁切（净像素提升 `+34% ~ +66%`）；
+  - 独立 `hair-worker.js`（MediaPipe `hair_segmenter`，每 2 帧分割 1 次，GPU 冷启动预热 + 6s 看门狗）精准剔除刘海与碎发区域，防止磨皮美白糊白发丝。
 - **主流播放器通用适配 & 保护边界尊重**：
   - 自动适配 **XGPlayer（抖音等）**、**Plyr**、**Bilibili**、**YouTube** 与通用 HTML5 `<video>`（含开放 Shadow DOM 与同源 `iframe`）；
   - 精准支持 `object-fit: contain` / `cover` / `fill` 叠层对齐、悬停小预览降权、上下刷视频切条自动跟随、失焦暂停静态调参、容器全屏保持与原生 `<video>` 全屏自动回退；
@@ -35,12 +37,15 @@
 
 ```mermaid
 flowchart LR
-  V["HTML5 &lt;video&gt;"] -->|rVFC / rAF 30fps| GL["WebGL 单 Pass 渲染<br/>UV微整形 + 12-tap磨皮 + 多通道遮罩"]
-  V -->|下采样 288-384px<br/>10-18fps 零拷贝 ImageBitmap| W["Web Worker (CPU XNNPACK)<br/>MediaPipe Face Landmarker 478点"]
-  W -->|主脸 IoU 锁定 + One-Euro 平滑| M["384×384 RGBA 语义遮罩<br/>R=肤区 G=眼部 B=唇部 + 面部锚点"]
-  M --> GL
+  V["HTML5 &lt;video&gt;"] -->|rVFC / rAF 30fps<br/>VideoFrame 零滞后帧同步| GL["WebGL 单 Pass 渲染<br/>UV微整形 + 12-tap磨皮 + 多通道遮罩"]
+  V -->|动态小脸 ROI 448-512px<br/>零拷贝 ImageBitmap| FW["face-worker.js (GPU/CPU)<br/>MediaPipe 478 点 + 死区稳定"]
+  FW -->|未检出时查表兜底| PS["可选 landmarks.bin<br/>132点离线预扫表 (timeMap对齐)"]
+  FW -->|256×256 面部语义遮罩| GL
+  FW -->|每2帧同步一次ROI| HW["hair-worker.js (GPU/CPU)<br/>MediaPipe 发丝分割遮罩"]
+  HW -->|剔除刘海/碎发| GL
+  PS -->|恢复人脸框并反馈下一帧ROI| GL
   GL --> O["非侵入 Canvas 叠层<br/>pointer-events: none"]
-  P["MV3 Popup 面板"] <-->|chrome.tabs / runtime| GL
+  UI["Popup / 页内悬浮面板"] <-->|chrome.tabs / runtime| GL
 ```
 
 ---
@@ -128,16 +133,32 @@ RB_CACHE_SWEEP_INTERVAL_MIN=60
 RB_CACHE_SWEEP=false         # 完全关掉自动清理
 ```
 
+### 离线关键点预扫（可选，减少复杂镜头掉妆）
+
+侧脸、运动模糊或远景小脸容易超过单帧实时检测极限，导致短暂回退为全帧肤色美颜。预扫模块可在本地对**已落盘的 TS 分片**做一次 4fps 离线扫描（**绝不回源拉流量**），生成 `132` 个核心点位的紧凑二进制表 `landmarks.bin`（10 分钟视频约 1.36 MB），在内置播放器回看时先查表兜底：
+
+```bash
+# 单跑扫描一条已缓存视频，并用自检脚本验证输出
+cd cache-server
+python prescan.py <safeKey>
+python ../scripts/check_landmarks.py ~/Videos/grab-cache/<safeKey>/landmarks.bin
+```
+
+- **HTTP 接口**：`POST /api/prescan/{key}`（触发异步扫描，`?force=1` 重扫）、`GET /api/prescan/{key}`（查进度）、`DELETE /api/prescan/{key}`（删预扫文件）、`GET /lm/{key}`（下载二进制表），`/api/library` 同步返回 `hasPrescan` 标记。
+- **时间轴对齐**：`mode=cached` 仅播放已缓存分片时，`player.html` 会基于实际 `#EXTINF` 时长生成分段映射表，确保查表不因跳过未缓存分片而错位。
+- **环境变量**：`RB_PRESCAN_FPS`（默认 `4`）、`RB_PRESCAN_MAX_FRAMES`（默认 `400000`）、`RB_PRESCAN_AUTO`（默认 `false`）。
+- 实测同一 2 分钟片段开启预扫后，`face_mask` 覆盖率较关闭前相对提升 `+50%`，渲染帧率仍稳定在 `~30 fps`。
+
 **为什么缓存要单独跑一个进程，而不是做进扩展里**：
 
 - 目标 CDN 会校验 TLS 指纹，需要 `curl_cffi impersonate="chrome"` 才能拿到分片；
 - 一集长片可能好几 GB，落到磁盘比塞 IndexedDB/OPFS 可靠（MV3 service worker 30 秒就被回收，也扛不住长下载）；
-- 合并与抽帧要用本机 ffmpeg。
+- 抽帧缩略图与离线解码要用本机 ffmpeg，离线关键点扫描也避免占用浏览器播放线程。
 
-**服务没启动时会自动降级**：扩展探测 `/api/keys` 失败 → `serverOnline=false` → 不改写任何 m3u8 → 原站播放器行为与没装扩展完全一致。
+**服务没启动时会自动降级**：扩展探测 `/health` 失败 → `serverOnline=false` → 不改写任何 m3u8 → 原站播放器行为与没装扩展完全一致。
 
 - 播放列表由**磁盘状态**现场生成，默认只列已落盘分片，原站 token 过期也能完整回看。
-- 详细架构、实测数据与踩坑记录见 [HANDOVER.md](HANDOVER.md)。
+- 详细架构、实测数据与变更记录见 [HANDOVER.md](HANDOVER.md) 与 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 
@@ -173,21 +194,30 @@ RB_CACHE_SWEEP=false         # 完全关掉自动清理
 
 ```text
 realtime-beauty/
-├── manifest.json             # MV3 清单（icons + wasm-unsafe-eval）
-├── icons/                    # 16 / 48 / 128 扩展图标
-├── popup/                    # 26 项 Wink/剪映专业分项调参面板、预设、JSON 方案与诊断
-├── content/engine.js         # 主引擎：选源、多播放器适配、EME/CORS探针、WebGL管线、L0-L3降级
-├── content/grab-hook.js      # 透明 HLS 缓存 hook（域名白名单 + 改写 m3u8 到本地代理）
-├── worker/face-worker.js     # 离主线程 MediaPipe 478 点推理、主脸锁定与 One-Euro 滤波
-├── ios/                      # iOS Safari 用户脚本（26 项调参 + 美颜剧场全屏 + 90° 横屏）
-├── cache-server/             # 可选本地服务：透明缓存 + 媒体库 + 内置播放器（FastAPI）
-│   ├── hls_proxy.py          #   分片级透明缓存
-│   ├── webui.py              #   媒体库 / 播放器 / 本地播放列表 / 缩略图
-│   └── web/                  #   播放器前端（hls.js + chrome.tabs 垫片 + 复用 engine.js）
-├── vendor/mediapipe/         # 离线 MediaPipe 模型与 ES Module WASM（npm run setup 拉取）
-├── test-page/index.html      # 可控边界测试页（双人脸、同源iframe、cover/contain、全屏、EME）
-├── scripts/                  # setup / check / build 零依赖 Node 脚本
-└── .github/workflows/ci.yml  # GitHub Actions 自动校验与打包工作流
+├── manifest.json                 # MV3 清单（icons + wasm-unsafe-eval）
+├── CHANGELOG.md                  # 版本与功能更新日志
+├── HANDOVER.md                   # 架构说明与实测交接文档
+├── icons/                        # 16 / 48 / 128 扩展图标
+├── popup/                        # 26 项 Wink/剪映专业分项调参面板、预设、JSON 方案与诊断
+├── content/
+│   ├── engine.js                 # 主引擎：零滞后帧同步、WebGL管线、L0-L3降级、prescan兜底
+│   ├── overlay-ui.js             # 页面悬浮调参面板、按站缓存开关与删除入口
+│   ├── player-bar.js             # 全站可选原站内嵌播放控制条
+│   └── grab-hook.js              # 透明 HLS 缓存 hook（按域名开关 + 改写 m3u8 到本地代理）
+├── worker/
+│   ├── face-worker.js            # 离主线程 MediaPipe 478 点推理与运动自适应稳定器
+│   └── hair-worker.js            # 离主线程 MediaPipe 发丝分割（刘海/碎发防误磨皮）
+├── ios/                          # iOS Safari 用户脚本（26 项调参 + 美颜剧场全屏 + 90° 横屏）
+├── cache-server/                 # 可选本地服务：透明缓存 + 离线预扫 + 媒体库（FastAPI）
+│   ├── hls_proxy.py              #   v4 分片级透明缓存
+│   ├── prescan.py / prescan_api.py # 离线人脸关键点预扫（132点二进制 + HTTP API）
+│   ├── maintenance.py            #   缓存定时自动清理（天数 / 容量上限）
+│   ├── webui.py                  #   媒体库 / 内置播放器 / 本地播放列表 / 缩略图
+│   └── web/                      #   播放器前端（hls.js + chrome API 垫片 + 复用 engine.js）
+├── vendor/mediapipe/             # 离线 MediaPipe 模型与 ES Module WASM（npm run setup 拉取）
+├── test-page/index.html          # 可控边界测试页（双人脸、同源iframe、cover/contain、全屏、EME）
+├── scripts/                      # setup / check / check_landmarks / build 脚本
+└── .github/workflows/ci.yml      # GitHub Actions 自动校验与打包工作流
 ```
 
 ---

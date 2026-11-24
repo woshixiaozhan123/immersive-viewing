@@ -2,3 +2,5 @@ fastapi>=0.115.0
 uvicorn>=0.32.0
 curl_cffi>=0.7.0
 pydantic>=2.9.0
+mediapipe>=1.2.0
+numpy>=2.0.0

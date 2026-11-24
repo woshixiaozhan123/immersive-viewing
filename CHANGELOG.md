@@ -1,0 +1,49 @@
+# 更新日志（Changelog）
+
+本文档记录 **实时美颜（realtime-beauty）** 的重要功能演进、修复与架构调整，按时间倒序排列。
+
+---
+
+## [未发布] - 2026-11-24
+
+### 新增（Added）
+- **离线人脸关键点预扫与查表兜底（`prescan`）**：解决侧脸、运动模糊、远景小脸等实时单帧检测容易掉回「肤色保边回退（`skin_fallback`）」的问题
+  - [cache-server/prescan.py](cache-server/prescan.py)：针对本地**已缓存 TS 分片**做 4fps 离线扫描（绝不回源拉流量），复用内置 `vendor/mediapipe/face_landmarker.task`；采用 `0.22` 检测阈值 + `isPlausibleFace` 校验 + 2.8× 动态紧裁剪 + 5 窗口高倍补检；抽取并保存 `engine.js` 实际消费的 **132** 个核心点位（脸廓、双目、双眉、内外唇及鼻翼锚点，消除多边形 `(0, 0)` 顶点拖尾伪影），写入定长小端二进制表 `landmarks.bin`（`RBPS v1`，`scale=10000`，`stride=544 B`，10 分钟片约 1.36 MB）与 `landmarks.json`；全局最多允许 1 个并发扫描任务，支持命令行单跑（`python prescan.py <safeKey>`），服务重启时自动重置残留 `running` 状态。
+  - [cache-server/prescan_api.py](cache-server/prescan_api.py)：提供 `GET/POST/DELETE /api/prescan/{key}`、`GET /lm/{key}`（静态二进制下发，缺失返回 404 不现场触发扫描）；`/api/library` 列表项新增 `hasPrescan` 标记。
+  - [cache-server/config.py](cache-server/config.py)：新增环境变量 `RB_PRESCAN_FPS`（默认 `4`）、`RB_PRESCAN_MAX_FRAMES`（默认 `400000`）、`RB_PRESCAN_AUTO`（默认 `false`）。
+  - [scripts/check_landmarks.py](scripts/check_landmarks.py)：新增 `landmarks.bin` 二进制头、体积、时间戳单调性与 20 帧随机抽样自检脚本。
+  - [cache-server/web/player.html](cache-server/web/player.html) 与 [content/engine.js](content/engine.js)：本地播放器自动生成 `mode=cached` 压缩时间轴映射 `window.__RB_FULL_TIME_MAP__` 并加载 `/lm/{key}`；仅在实时 Worker `RESULT` 判为无脸时执行 O(log N) 二分查表兜底并恢复 `lastFaceBox`，`this.prescan === null` 时线上扩展链路行为保持 100% 不变。
+- **独立发丝分割与真实推理分辨率修复**：
+  - [worker/hair-worker.js](worker/hair-worker.js) 与 [scripts/fetch-mediapipe.mjs](scripts/fetch-mediapipe.mjs)：新增基于 MediaPipe `hair_segmenter` 的独立 Web Worker（每 2 帧人脸推理同步分割 1 次，零拷贝 256×256 单通道遮罩，`shader` 内自动剔除刘海与碎发防止糊白漆），并内置冷启动预热与 6 秒看门狗恢复机制。
+  - [content/engine.js](content/engine.js)：修复小脸动态裁切下推理边长被压回 `384` 导致净分辨率原地踏步的缺陷，将门槛放宽至 `45%/55%` 并保持 `448–512` 推理边长（半身/特写人脸净像素提升 `+34% ~ +66%`）。
+- **v4 透明 HLS 本地缓存、按站开关与本地媒体库 / 播放器**：
+  - [cache-server/hls_proxy.py](cache-server/hls_proxy.py)、[content/grab-hook.js](content/grab-hook.js)、[content/grab-relay.js](content/grab-relay.js)：透明接管 `hls.js` / 原生 m3u8 到本地代理，边看边存零额外流量，缓存进度实时显示在美颜面板中。
+  - **按站开关与手动删除**：缓存**默认全关**，在面板中按域名开关支持中途不停播热切；提供「删除本视频 / 清空本站」按钮即时释放磁盘。
+  - [cache-server/maintenance.py](cache-server/maintenance.py)：后台定时自动清理（默认保留 7 天 / 上限 20 GB），支持媒体库页手动「立即清理」。
+  - [cache-server/webui.py](cache-server/webui.py) 与 [cache-server/web/](cache-server/web/)：提供本地媒体库 `GET /`、内置播放器 `GET /play/{safeKey}`（默认 `mode=cached` 离线可看）及无扩展可用的 Chrome API 垫片 `shim.js`。
+- **原站内嵌自制播放控制条**：
+  - [content/player-bar.js](content/player-bar.js)：支持全站原生视频套用统一播放控制条（进度预览、倍速、音量、画中画、全屏），按域名独立开关记忆。
+
+### 变更与修复（Changed & Fixed）
+- **移除废弃 v3 整片下载管线**：清理 `grab_pipeline.py`、`grab_models.py`、`POST /api/grab`、`/local/{key}/out.mp4` 等 56 KB 死代码，统一采用 v4 透明分片缓存。
+- **修复控制面板误隐藏行**：修复页面脚本尚未注入时面板开关行被静默隐藏的问题（[content/overlay-ui.js](content/overlay-ui.js)），并明确说明 `cache-server` 为完全可选组件，未启动时扩展零影响。
+
+### 实测验证摘要（1920×1080 真实缓存样本 `avbebe.com_archives_357404`）
+- 同 0–120 秒播放窗口 500ms 采样 A/B 对照：关闭预扫 `face_mask` 为 **31.67%**（76/240），开启预扫提升至 **47.50%**（114/240，相对 **+50.0%**），`prescan.hits = 558`，`avgRenderFps` 保持 **29.90 fps**。
+- 同时间戳静止帧 Canvas Diff：`11,924` 个变化像素 **100.0%** 落入人脸 ROI 框内，左上角 `(0, 0)` 零多边形拖尾伪影。
+
+---
+
+## [1.1.0] - 2026-11-23
+
+### 新增与优化
+- **26 项 Wink / 剪映专业级分项美颜管线**：美肤 7 项、美型 8 项（含纵横比校正与 `yawFactor` 侧脸防拉扯）、美妆 5 项（含 4 款口红色号）、调色 6 项。
+- **零滞后帧同步人脸追踪 & 悬浮球 UI**：主视频帧通过 `VideoFrame` 与 `pendingTex` 原子锁帧（0.00ms 滞后），配合紧致 Face-ROI 高清遮罩与页面悬浮调参面板。
+- **配方生态与 iOS 用户脚本**：内置 7 档预设（含「减龄打底」）、Wink/小红书中文配方文本解析器，以及支持「美颜剧场全屏 + 一键 90° 横屏」的 [ios/realtime-beauty-ios.user.js](ios/realtime-beauty-ios.user.js)。
+
+---
+
+## [1.0.0] - 2026-11-22
+
+### 初始发布
+- 桌面 Chromium MV3 扩展首个开源版本：WebGL 单 Pass 美颜引擎、MediaPipe 478 点人脸遮罩、L0–L3 性能自适应降级、EME/CORS 保护边界检测与 CI 自动打包工作流。
