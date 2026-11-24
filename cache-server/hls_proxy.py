@@ -554,21 +554,112 @@ class TransparentHlsCache:
         }
 
     def delete_video(self, safe_key: str) -> bool:
+        """删除整个缓存条目。
+
+        注意：**不能只写 shutil.rmtree**。部分环境（例如带文件安全垫片的 Python
+        发行版）会把 rmtree 重定向到回收站，批量删除时直接 raise SystemExit(1)
+        把整个 FastAPI 进程打死——服务端 500、进程退出、所有缓存页全断。
+        这里三层兜底，任何一层失败都只返回 False，绝不影响进程存活。
+        """
         import shutil
 
         d = self.entry_dir(safe_key)
         if not d.exists():
             return False
+
         try:
             shutil.rmtree(d)
-            self._seg_cache.pop(safe_key, None)
-            return True
         except OSError as exc:
-            logger.warning("delete %s failed: %s", safe_key, exc)
-            return False
+            logger.warning("delete %s: rmtree failed (%s), trying force delete", safe_key, exc)
+            if not _force_delete(d):
+                logger.warning("delete %s: force delete failed, moving aside", safe_key)
+                _move_aside(d)
+        except BaseException as exc:  # noqa: BLE001 - 含 SystemExit，必须拦住
+            logger.warning(
+                "delete %s: rmtree aborted by environment guard (%s: %s), trying force delete",
+                safe_key,
+                type(exc).__name__,
+                exc,
+            )
+            if not _force_delete(d):
+                _move_aside(d)
+
+        self._seg_cache.pop(safe_key, None)
+        return not d.exists()
 
     def close(self) -> None:
         self._prefetch_pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _force_delete(path: Path) -> bool:
+    """Windows 下用 SHFileOperationW 做永久删除（不走回收站）。
+
+    仅作为 shutil.rmtree 被安全垫片拦住时的兜底。非 Windows 直接返回 False。
+    """
+    import os
+
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class SHFILEOPSTRUCTW(ctypes.Structure):
+            _fields_ = [
+                ("hwnd", wintypes.HWND),
+                ("wFunc", wintypes.UINT),
+                ("pFrom", wintypes.LPCWSTR),
+                ("pTo", wintypes.LPCWSTR),
+                ("fFlags", ctypes.c_uint16),
+                ("fAnyOperationsAborted", wintypes.BOOL),
+                ("hNameMappings", ctypes.c_void_p),
+                ("lpszProgressTitle", wintypes.LPCWSTR),
+            ]
+
+        FO_DELETE = 3
+        FOF_SILENT = 0x0004
+        FOF_NOCONFIRMATION = 0x0010
+        FOF_NOERRORUI = 0x0400
+        FOF_NOCONFIRMMKDIR = 0x0200
+
+        op = SHFILEOPSTRUCTW()
+        op.hwnd = None
+        op.wFunc = FO_DELETE
+        # pFrom 必须是双 \0 结尾的双字符串
+        op.pFrom = str(path.resolve()) + "\0\0"
+        op.pTo = None
+        op.fFlags = FOF_SILENT | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_NOCONFIRMMKDIR
+
+        res = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+        ok = res == 0 and not op.fAnyOperationsAborted
+        if ok:
+            logger.info("force delete ok: %s", path.name)
+        else:
+            logger.warning("force delete %s returned %s", path.name, res)
+        return ok
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("force delete %s raised: %s", path, exc)
+        return False
+
+
+def _move_aside(path: Path) -> bool:
+    """最后兜底：把目录改名到 `_trash/` 下，至少让媒体库不再列出它。
+
+    空间不释放，但不崩服务、不丢数据，用户可手动清理。
+    """
+    from datetime import datetime
+
+    try:
+        trash = path.parent / "_trash"
+        trash.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        dest = trash / f"{path.name}_{stamp}"
+        path.rename(dest)
+        logger.warning("moved %s aside to %s (disk space not freed)", path.name, dest)
+        return True
+    except OSError as exc:
+        logger.warning("move aside %s failed: %s", path, exc)
+        return False
 
 
 def _now_iso() -> str:

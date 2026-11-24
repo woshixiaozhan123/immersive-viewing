@@ -347,12 +347,12 @@ body.player-page {
 #splash .msg { max-width: 520px; line-height: 1.75; }
 #splash .hint { font-size: 12.5px; color: #5d6478; }
 
-/* 底部缓存进度条 */
+/* 底部缓存进度条 —— 让出播放器控制条的高度，避免两层叠在一起 */
 #tracebar {
   position: fixed;
   left: 0;
   right: 0;
-  bottom: 0;
+  bottom: 58px;
   z-index: 39;
   padding: 10px 20px 14px;
   background: linear-gradient(0deg, rgba(0, 0, 0, 0.82), rgba(0, 0, 0, 0));

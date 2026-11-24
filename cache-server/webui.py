@@ -76,6 +76,7 @@ _MIME = {
 _STATIC_EXACT = {
     "engine.js": PROJECT_ROOT / "content" / "engine.js",
     "overlay-ui.js": PROJECT_ROOT / "content" / "overlay-ui.js",
+    "player-bar.js": PROJECT_ROOT / "content" / "player-bar.js",
     "worker/face-worker.js": PROJECT_ROOT / "worker" / "face-worker.js",
     "vendor/hls.min.js": WEB_DIR / "vendor" / "hls.min.js",
     "shim.js": WEB_DIR / "shim.js",
@@ -278,7 +279,8 @@ def list_library() -> list[dict[str, Any]]:
         return []
     items: list[dict[str, Any]] = []
     try:
-        entries = [p for p in root.iterdir() if p.is_dir()]
+        # `_trash` 是删除失败时的兜底目录，不能当成正常条目列出来
+        entries = [p for p in root.iterdir() if p.is_dir() and not p.name.startswith("_")]
     except OSError:
         return []
     for d in entries:
