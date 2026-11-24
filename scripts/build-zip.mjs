@@ -27,7 +27,7 @@ const INCLUDE_PATHS = [
   "LICENSE",
   "THIRD_PARTY_NOTICES.md",
   "icons",
-  "popup",
+  "background",
   "content",
   "worker",
   "test-page",

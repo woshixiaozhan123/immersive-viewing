@@ -12,7 +12,9 @@ const ROOT = path.resolve(__dirname, "..");
 const REQUIRE_MODELS = process.argv.includes("--require-models");
 
 const JS_FILES = [
+  "background/service-worker.js",
   "content/engine.js",
+  "content/overlay-ui.js",
   "worker/face-worker.js",
   "popup/popup.js",
   "ios/realtime-beauty-ios.user.js",
@@ -23,10 +25,9 @@ const JS_FILES = [
 
 const CORE_FILES = [
   "manifest.json",
-  "popup/popup.html",
-  "popup/popup.css",
-  "popup/popup.js",
+  "background/service-worker.js",
   "content/engine.js",
+  "content/overlay-ui.js",
   "worker/face-worker.js",
   "ios/realtime-beauty-ios.user.js",
   "icons/icon16.png",
@@ -54,7 +55,9 @@ for (const rel of JS_FILES) {
 // 2. Manifest check
 const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, "manifest.json"), "utf8"));
 if (manifest.manifest_version !== 3) throw new Error("manifest_version must be 3");
-if (!manifest.action?.default_popup) throw new Error("Missing action.default_popup");
+if (!manifest.background?.service_worker && !manifest.action?.default_popup) {
+  throw new Error("Missing background.service_worker or action.default_popup");
+}
 console.log(`[manifest ok] ${manifest.name} v${manifest.version} (MV3)`);
 
 // 3. Core assets check

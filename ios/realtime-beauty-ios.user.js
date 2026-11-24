@@ -294,11 +294,21 @@
     397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
     172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109,
   ];
+  const FOREHEAD_EXTEND = {
+    10: 0.052, 338: 0.048, 109: 0.048, 297: 0.036, 67: 0.036, 332: 0.020, 103: 0.020,
+  };
   const LEFT_EYE_IDX = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246];
   const RIGHT_EYE_IDX = [263, 249, 390, 373, 374, 380, 381, 382, 362, 398, 384, 385, 386, 387, 388, 466];
   const LEFT_BROW_IDX = [70, 63, 105, 66, 107, 55, 65, 52, 53, 46];
   const RIGHT_BROW_IDX = [300, 293, 334, 296, 336, 285, 295, 282, 283, 276];
-  const LIPS_IDX = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185];
+  const LIPS_OUTER_IDX = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185];
+  const LIPS_INNER_IDX = [78, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308, 415, 310, 311, 312, 13, 82, 81, 80, 191];
+  const SMALL_FACE_SCAN_ROIS = [
+    { x: 0.16, y: 0.04, w: 0.68, h: 0.72 },
+    { x: 0.24, y: 0.14, w: 0.52, h: 0.58 },
+    { x: 0.00, y: 0.06, w: 0.56, h: 0.70 },
+    { x: 0.44, y: 0.06, w: 0.56, h: 0.70 },
+  ];
 
   function safeStorageGet(key, fallback) {
     try {
@@ -542,47 +552,85 @@
     return { params: out, matched: matchedKeys.size, skipped };
   }
 
-  // ==================== Inline MediaPipe 478-Point Worker ====================
+  // ==================== Inline MediaPipe 478-Point Worker (Zero-Lag IMAGE + ROI Edition) ====================
   const FACE_WORKER_SOURCE = `
     let landmarker = null;
     let initialized = false;
     let lastDetectTs = 0;
     let lockedBox = null;
     let lostSinceTs = 0;
-    const LOCK_GRACE_MS = 220;
+    const LOCK_GRACE_MS = 140;
 
-    class LowPassFilter {
-      constructor(a) { this.y = null; this.s = null; this.alpha = a; }
-      filter(v, a) {
-        if (a !== undefined) this.alpha = a;
-        this.s = this.y === null ? v : this.alpha * v + (1 - this.alpha) * this.s;
-        this.y = v;
-        return this.s;
+    const FAST_SET = new Set([
+      33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246,
+      263, 249, 390, 373, 374, 380, 381, 382, 362, 398, 384, 385, 386, 387, 388, 466,
+      70, 63, 105, 66, 107, 55, 65, 52, 53, 46,
+      300, 293, 334, 296, 336, 285, 295, 282, 283, 276,
+      61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185,
+      78, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308, 415, 310, 311, 312, 13, 82, 81, 80, 191,
+    ]);
+    const RIGID_ANCHORS = [1, 33, 133, 263, 362, 168, 152, 234, 454];
+
+    class MotionAdaptiveStabilizer {
+      constructor() { this.reset(); }
+      reset() { this.prevX = null; this.prevY = null; this.prevTs = null; this.velX = null; this.velY = null; }
+      process(raw, box, tsMs, mode = "paired") {
+        const n = raw.length;
+        const out = new Float32Array(n * 4);
+        const tsSec = tsMs / 1000;
+        if (!this.prevX || this.prevX.length !== n || this.prevTs === null || tsSec - this.prevTs > 0.25) {
+          this.prevX = new Float32Array(n); this.prevY = new Float32Array(n);
+          this.velX = new Float32Array(n); this.velY = new Float32Array(n);
+          this.prevTs = tsSec;
+          for (let i = 0; i < n; i++) {
+            this.prevX[i] = raw[i].x; this.prevY[i] = raw[i].y;
+            out[i * 4] = raw[i].x; out[i * 4 + 1] = raw[i].y;
+          }
+          return out;
+        }
+        const dt = Math.max(tsSec - this.prevTs, 1e-3);
+        this.prevTs = tsSec;
+        const faceScale = Math.max(box.w, box.h, 0.04);
+        let sumD = 0, cnt = 0;
+        for (let k = 0; k < RIGID_ANCHORS.length; k++) {
+          const idx = RIGID_ANCHORS[k];
+          if (idx < n) { sumD += Math.hypot(raw[idx].x - this.prevX[idx], raw[idx].y - this.prevY[idx]); cnt++; }
+        }
+        const gDisp = cnt > 0 ? (sumD / cnt) / faceScale : 0;
+        const gBoost = mode === "paired"
+          ? Math.max(0, Math.min(1, (gDisp - 0.0045) / 0.0075))
+          : Math.max(0, Math.min(1, (gDisp - 0.006) / 0.012));
+        const vBlend = gDisp > 0.025 ? 0.85 : 0.55;
+        for (let i = 0; i < n; i++) {
+          const rx = raw[i].x, ry = raw[i].y;
+          const px = this.prevX[i], py = this.prevY[i];
+          const dx = rx - px, dy = ry - py;
+          const nd = Math.hypot(dx, dy) / faceScale;
+          const isFast = FAST_SET.has(i);
+          const lo = isFast ? 0.0022 : 0.0032;
+          const hi = isFast ? 0.0075 : 0.0110;
+          const baseA = isFast ? 0.62 : 0.52;
+          const m = Math.max(gBoost, Math.max(0, Math.min(1, (nd - lo) / (hi - lo))));
+          const a = m >= 0.99 ? 1.0 : baseA + (1.0 - baseA) * m;
+          const fx = a >= 1.0 ? rx : px + dx * a;
+          const fy = a >= 1.0 ? ry : py + dy * a;
+          const ivx = Math.max(-3, Math.min(3, (fx - px) / dt));
+          const ivy = Math.max(-3, Math.min(3, (fy - py) / dt));
+          const vx = this.velX[i] * (1 - vBlend) + ivx * vBlend;
+          const vy = this.velY[i] * (1 - vBlend) + ivy * vBlend;
+          this.prevX[i] = fx; this.prevY[i] = fy; this.velX[i] = vx; this.velY[i] = vy;
+          out[i * 4] = fx; out[i * 4 + 1] = fy; out[i * 4 + 2] = vx; out[i * 4 + 3] = vy;
+        }
+        return out;
       }
-      reset() { this.y = null; this.s = null; }
     }
-    class OneEuroFilter {
-      constructor(minC = 1.4, beta = 0.08, dC = 1.0) {
-        this.minC = minC; this.beta = beta; this.dC = dC;
-        this.xF = new LowPassFilter(1); this.dxF = new LowPassFilter(1);
-        this.lastTime = null; this.lastVelocity = 0;
-      }
-      alpha(c, dt) { const tau = 1 / (2 * Math.PI * c); return 1 / (1 + tau / Math.max(dt, 1e-4)); }
-      filter(x, ts) {
-        if (this.lastTime === null) { this.lastTime = ts; this.lastVelocity = 0; return this.xF.filter(x, 1); }
-        const dt = Math.max(ts - this.lastTime, 1e-3);
-        this.lastTime = ts;
-        const dx = this.xF.y !== null ? (x - this.xF.y) / dt : 0;
-        const edx = this.dxF.filter(dx, this.alpha(this.dC, dt));
-        this.lastVelocity = edx;
-        return this.xF.filter(x, this.alpha(this.minC + this.beta * Math.abs(edx), dt));
-      }
-      reset() { this.xF.reset(); this.dxF.reset(); this.lastTime = null; this.lastVelocity = 0; }
-    }
-    let filters = null;
-    function resetTracking() {
-      lockedBox = null; lostSinceTs = 0;
-      if (filters) for (const p of filters) { p.x.reset(); p.y.reset(); }
+    const stab = new MotionAdaptiveStabilizer();
+    function resetTracking() { lockedBox = null; lostSinceTs = 0; stab.reset(); }
+    function mapRoi(raw, roi) {
+      if (!roi || (roi.x === 0 && roi.y === 0 && roi.w === 1 && roi.h === 1)) return raw;
+      const out = new Array(raw.length);
+      for (let i = 0; i < raw.length; i++) out[i] = { x: roi.x + raw[i].x * roi.w, y: roi.y + raw[i].y * roi.h, z: raw[i].z };
+      return out;
     }
     function bbox(lm) {
       let minX = 1, minY = 1, maxX = 0, maxY = 0;
@@ -591,7 +639,13 @@
         if (p.x < minX) minX = p.x; if (p.y < minY) minY = p.y;
         if (p.x > maxX) maxX = p.x; if (p.y > maxY) maxY = p.y;
       }
-      return { minX, minY, maxX, maxY, area: Math.max(0, (maxX - minX) * (maxY - minY)) };
+      const w = Math.max(0, maxX - minX), h = Math.max(0, maxY - minY);
+      return { minX, minY, maxX, maxY, w, h, cx: (minX + maxX) * 0.5, cy: (minY + maxY) * 0.5, area: w * h };
+    }
+    function plausible(lm, b) {
+      if (!lm || lm.length < 468 || b.w < 0.012 || b.h < 0.015 || b.w > 1.25 || b.h > 1.35) return false;
+      const l = lm[33], r = lm[263];
+      return !!(l && r && Math.hypot(r.x - l.x, r.y - l.y) >= 0.005);
     }
     function iou(a, b) {
       const inter = Math.max(0, Math.min(a.maxX, b.maxX) - Math.max(a.minX, b.minX)) *
@@ -599,20 +653,40 @@
       const u = a.area + b.area - inter;
       return u > 0 ? inter / u : 0;
     }
-    function pickPrimary(list, nowMs) {
+    function pickPrimary(list, roi, nowMs) {
       if (!list || !list.length) {
         if (lockedBox && lostSinceTs === 0) lostSinceTs = nowMs;
         if (lockedBox && nowMs - lostSinceTs > LOCK_GRACE_MS) resetTracking();
         return null;
       }
-      const cands = list.map((lm) => ({ lm, box: bbox(lm) }));
+      const cands = [];
+      for (let i = 0; i < list.length; i++) {
+        const lm = mapRoi(list[i], roi);
+        const box = bbox(lm);
+        if (plausible(lm, box)) cands.push({ lm, box });
+      }
+      if (!cands.length) {
+        if (lockedBox && lostSinceTs === 0) lostSinceTs = nowMs;
+        if (lockedBox && nowMs - lostSinceTs > LOCK_GRACE_MS) resetTracking();
+        return null;
+      }
       let chosen = null;
-      if (lockedBox) {
+      if (cands.length === 1) {
+        chosen = cands[0];
+        if (lockedBox) {
+          const ov = iou(lockedBox, chosen.box);
+          const sc = Math.max(lockedBox.w, lockedBox.h, chosen.box.w, chosen.box.h, 0.05);
+          if (ov < 0.04 && Math.hypot(chosen.box.cx - lockedBox.cx, chosen.box.cy - lockedBox.cy) / sc > 1.2) stab.reset();
+        }
+      } else if (lockedBox) {
         let best = -1;
+        const sc = Math.max(lockedBox.w, lockedBox.h, 0.05);
         for (const c of cands) {
           const ov = iou(lockedBox, c.box);
-          const sc = ov * 0.75 + Math.min(c.box.area * 2.5, 0.25);
-          if (ov > 0.15 && sc > best) { best = sc; chosen = c; }
+          const prox = Math.max(0, 1 - Math.hypot(c.box.cx - lockedBox.cx, c.box.cy - lockedBox.cy) / (sc * 2.2));
+          const sr = Math.min(c.box.area, lockedBox.area) / Math.max(c.box.area, lockedBox.area, 1e-5);
+          const score = ov * 0.55 + prox * 0.30 + sr * 0.15;
+          if ((ov > 0.04 || prox > 0.35) && score > best) { best = score; chosen = c; }
         }
         if (!chosen) {
           if (lostSinceTs === 0) lostSinceTs = nowMs;
@@ -620,42 +694,41 @@
           resetTracking();
         }
       }
-      if (!chosen) { cands.sort((a, b) => b.box.area - a.box.area); chosen = cands[0]; }
+      if (!chosen) { cands.sort((a, b) => b.box.area - a.box.area); chosen = cands[0]; stab.reset(); }
       lockedBox = chosen.box; lostSinceTs = 0;
-      return chosen.lm;
-    }
-    function smooth(raw, tsMs) {
-      const tsSec = tsMs / 1000;
-      if (!filters || filters.length !== raw.length) {
-        filters = raw.map(() => ({ x: new OneEuroFilter(1.4, 0.08, 1), y: new OneEuroFilter(1.4, 0.08, 1) }));
-      }
-      const out = new Float32Array(raw.length * 4);
-      for (let i = 0; i < raw.length; i++) {
-        out[i * 4] = filters[i].x.filter(raw[i].x, tsSec);
-        out[i * 4 + 1] = filters[i].y.filter(raw[i].y, tsSec);
-        out[i * 4 + 2] = filters[i].x.lastVelocity;
-        out[i * 4 + 3] = filters[i].y.lastVelocity;
-      }
-      return out;
+      return chosen;
     }
     self.onmessage = async (e) => {
       const msg = e.data;
       if (!msg) return;
       if (msg.type === "INIT") {
+        const pref = msg.delegate || "GPU";
         try {
           if (landmarker && landmarker.close) landmarker.close();
           const mod = await import(msg.bundleUrl);
-          const fileset = await mod.FilesetResolver.forVisionTasks(msg.wasmDir, true);
-          landmarker = await mod.FaceLandmarker.createFromOptions(fileset, {
-            baseOptions: { modelAssetPath: msg.modelUrl, delegate: "CPU" },
-            runningMode: "VIDEO",
-            numFaces: 3,
-            minFaceDetectionConfidence: 0.5,
-            minFacePresenceConfidence: 0.5,
-            minTrackingConfidence: 0.5,
-          });
-          initialized = true;
-          self.postMessage({ type: "READY", delegate: "CPU" });
+          const tryOrder = pref === "CPU" ? ["CPU"] : ["GPU", "CPU"];
+          for (const del of tryOrder) {
+            try {
+              const fileset = await mod.FilesetResolver.forVisionTasks(msg.wasmDir, true);
+              landmarker = await mod.FaceLandmarker.createFromOptions(fileset, {
+                baseOptions: { modelAssetPath: msg.modelUrl, delegate: del },
+                runningMode: "IMAGE",
+                numFaces: 2,
+                minFaceDetectionConfidence: 0.22,
+                minFacePresenceConfidence: 0.22,
+                minTrackingConfidence: 0.50,
+              });
+              initialized = true;
+              self.postMessage({ type: "READY", delegate: del });
+              return;
+            } catch (err) {
+              if (del === "GPU" && pref !== "CPU") {
+                self.postMessage({ type: "FALLBACK_CPU", reason: err && err.message ? err.message : String(err) });
+                return;
+              }
+              throw err;
+            }
+          }
         } catch (err) {
           initialized = false;
           self.postMessage({ type: "UNAVAILABLE", reason: err && err.message ? err.message : String(err) });
@@ -671,17 +744,27 @@
       }
       if (msg.type === "FRAME") {
         const bmp = msg.bitmap;
+        const roi = msg.roi || { x: 0, y: 0, w: 1, h: 1 };
         try {
-          if (!initialized || !landmarker) { self.postMessage({ type: "NO_MODEL" }); return; }
+          if (!initialized || !landmarker) { self.postMessage({ type: "NO_MODEL", frameId: msg.frameId }); return; }
+          if (msg.sceneCut) resetTracking();
+          const t0 = performance.now();
           const ts = Math.max(lastDetectTs + 1, Math.floor(msg.timestampMs || performance.now()));
           lastDetectTs = ts;
-          const res = landmarker.detectForVideo(bmp, ts);
-          const primary = pickPrimary(res.faceLandmarks, ts);
-          if (!primary) { self.postMessage({ type: "RESULT", hasFace: false }); return; }
-          const sm = smooth(primary, ts);
-          self.postMessage({ type: "RESULT", hasFace: true, landmarks: sm }, [sm.buffer]);
+          const res = landmarker.detect(bmp);
+          const inferMs = performance.now() - t0;
+          const primary = pickPrimary(res.faceLandmarks, roi, ts);
+          if (!primary) {
+            self.postMessage({ type: "RESULT", hasFace: false, frameId: msg.frameId, timestampMs: msg.timestampMs, inferMs, roiUsed: roi });
+            return;
+          }
+          const sm = stab.process(primary.lm, primary.box, ts, msg.mode || "paired");
+          self.postMessage({
+            type: "RESULT", hasFace: true, landmarks: sm, faceBox: primary.box,
+            frameId: msg.frameId, timestampMs: msg.timestampMs, inferMs, roiUsed: roi,
+          }, [sm.buffer]);
         } catch (err) {
-          self.postMessage({ type: "ERROR", reason: err && err.message ? err.message : String(err) });
+          self.postMessage({ type: "ERROR", frameId: msg.frameId, reason: err && err.message ? err.message : String(err) });
         } finally {
           if (bmp && bmp.close) bmp.close();
         }
@@ -692,53 +775,60 @@
   class MainThreadFaceTracker {
     constructor() {
       this.landmarker = null;
-      this.lastDetectTs = 0;
+      this.lockedBox = null;
     }
     async init() {
       const mod = await import(MP_BUNDLE_URL);
       const fileset = await mod.FilesetResolver.forVisionTasks(MP_WASM_DIR, true);
       this.landmarker = await mod.FaceLandmarker.createFromOptions(fileset, {
         baseOptions: { modelAssetPath: MP_MODEL_URL, delegate: "CPU" },
-        runningMode: "VIDEO",
+        runningMode: "IMAGE",
         numFaces: 2,
-        minFaceDetectionConfidence: 0.5,
-        minFacePresenceConfidence: 0.5,
-        minTrackingConfidence: 0.5,
+        minFaceDetectionConfidence: 0.24,
+        minFacePresenceConfidence: 0.24,
+        minTrackingConfidence: 0.50,
       });
     }
-    reset() {}
-    detect(canvas, nowMs) {
+    reset() { this.lockedBox = null; }
+    detect(canvas, roi = { x: 0, y: 0, w: 1, h: 1 }) {
       if (!this.landmarker) return null;
-      const ts = Math.max(this.lastDetectTs + 1, Math.floor(nowMs || performance.now()));
-      this.lastDetectTs = ts;
-      const res = this.landmarker.detectForVideo(canvas, ts);
+      const res = this.landmarker.detect(canvas);
       const list = res.faceLandmarks;
       if (!list || !list.length) return null;
-      let best = list[0];
+      let best = null;
+      let bestBox = null;
       let bestArea = -1;
-      for (const lm of list) {
+      for (const raw of list) {
         let minX = 1, minY = 1, maxX = 0, maxY = 0;
-        for (const p of lm) {
-          if (p.x < minX) minX = p.x;
-          if (p.y < minY) minY = p.y;
-          if (p.x > maxX) maxX = p.x;
-          if (p.y > maxY) maxY = p.y;
+        const mapped = new Array(raw.length);
+        for (let i = 0; i < raw.length; i++) {
+          const x = roi.x + raw[i].x * roi.w;
+          const y = roi.y + raw[i].y * roi.h;
+          mapped[i] = { x, y };
+          if (x < minX) minX = x; if (y < minY) minY = y;
+          if (x > maxX) maxX = x; if (y > maxY) maxY = y;
         }
-        const a = (maxX - minX) * (maxY - minY);
-        if (a > bestArea) { bestArea = a; best = lm; }
+        const w = Math.max(0, maxX - minX), h = Math.max(0, maxY - minY);
+        const a = w * h;
+        if (w >= 0.012 && h >= 0.015 && a > bestArea) {
+          bestArea = a;
+          best = mapped;
+          bestBox = { minX, minY, maxX, maxY, w, h, cx: (minX + maxX) * 0.5, cy: (minY + maxY) * 0.5, area: a };
+        }
       }
+      if (!best) return null;
+      this.lockedBox = bestBox;
       const out = new Float32Array(best.length * 4);
       for (let i = 0; i < best.length; i++) {
         out[i * 4] = best[i].x;
         out[i * 4 + 1] = best[i].y;
-        out[i * 4 + 2] = 0;
-        out[i * 4 + 3] = 0;
       }
-      return out;
+      return { landmarks: out, faceBox: bestBox };
     }
     close() {
       try { if (this.landmarker && this.landmarker.close) this.landmarker.close(); } catch (_) {}
       this.landmarker = null;
+      this.lockedBox = null;
     }
   }
 
@@ -770,6 +860,8 @@
     uniform vec4 u_lipColor;  // (lipR, lipG, lipB, aspect)
     uniform vec4 u_colorA;    // (sharpen, exposure, contrast, saturation)
     uniform vec4 u_colorB;    // (temperature, softGlow, fade, liteMode)
+    uniform vec4 u_maskRect;  // (rx, ry, invRw, invRh) tight face-ROI mask UV mapping
+    uniform vec4 u_yawVis;    // (leftVis, rightVis, reshapeGate, mouthHalfW)
 
     uniform vec4 u_eyes;          // (leftEyeX, leftEyeY, rightEyeX, rightEyeY)
     uniform vec4 u_eyeOuter;      // (leftOuterX, leftOuterY, rightOuterX, rightOuterY)
@@ -821,13 +913,14 @@
       return 1.0 - smoothstep(width * 0.25, width, dist);
     }
 
-    float underEyeMask(vec2 uv, vec2 eyeCenter, float eyeR, float aspect) {
+    float underEyeMask(vec2 uv, vec2 eyeCenter, float eyeR, float aspect, vec2 rightA, vec2 upA) {
       if (eyeR <= 0.001) return 0.0;
-      vec2 c = eyeCenter + vec2(0.0, eyeR * 0.78);
-      vec2 d = uv - c;
-      d.x *= aspect;
-      vec2 nd = vec2(d.x / (eyeR * 1.15), d.y / (eyeR * 0.52));
-      float r2 = dot(nd, nd);
+      vec2 cOffsetA = -upA * (eyeR * 0.74);
+      vec2 c = eyeCenter + vec2(cOffsetA.x / aspect, cOffsetA.y);
+      vec2 dA = vec2((uv.x - c.x) * aspect, uv.y - c.y);
+      float lx = dot(dA, rightA) / (eyeR * 1.15);
+      float ly = dot(dA, upA) / (eyeR * 0.50);
+      float r2 = lx * lx + ly * ly;
       return clamp(1.0 - smoothstep(0.15, 1.0, r2), 0.0, 1.0);
     }
 
@@ -931,64 +1024,70 @@
         return;
       }
 
+      vec2 noseTip = u_noseBridge.zw;
+      vec2 chinPt  = u_chinMouth.xy;
+      vec2 upA     = normalize(vec2((u_noseBridge.x - noseTip.x) * aspect, u_noseBridge.y - noseTip.y) + vec2(0.0, -1e-4));
+      vec2 rightA  = vec2(-upA.y, upA.x);
+      vec2 upUv    = vec2(upA.x / aspect, upA.y);
+
+      float leftVis     = u_yawVis.x;
+      float rightVis    = u_yawVis.y;
+      float reshapeGate = u_yawVis.z;
+      float mouthHalfW  = u_yawVis.w;
+      float maxVis      = max(leftVis, rightVis);
+
       vec2 wuv = v_uv;
       float anyReshape =
         slimFaceAmt + slimCheekAmt + abs(vChinAmt) + bigEyesAmt +
         abs(eyeTiltAmt) + slimNoseAmt + abs(mouthSizeAmt) + mouthSmileAmt;
-      if (u_hasFaceMask > 0.5 && liteMode < 0.5 && faceFade > 0.001 && yawFactor > 0.01 && anyReshape > 0.001) {
-        float wFade = faceFade * yawFactor;
+      if (u_hasFaceMask > 0.5 && liteMode < 0.5 && faceFade > 0.001 && reshapeGate > 0.01 && maxVis > 0.01 && anyReshape > 0.001) {
+        float baseFade = faceFade * reshapeGate;
+        float wL = baseFade * leftVis;
+        float wR = baseFade * rightVis;
+        float wCenter = baseFade * maxVis * (0.45 + 0.55 * yawFactor);
         float fw = max(u_eyeRadii.z, 0.02);
         float fh = max(u_eyeRadii.w, 0.02);
-        vec2 noseTip = u_noseBridge.zw;
-        vec2 chinPt  = u_chinMouth.xy;
-        vec2 faceUp  = normalize((u_noseBridge.xy - noseTip) + vec2(0.0, -1e-4));
 
         if (bigEyesAmt > 0.001) {
-          float be = bigEyesAmt * wFade;
-          wuv = warpEye(wuv, u_eyes.xy, u_eyeRadii.x, be, aspect);
-          wuv = warpEye(wuv, u_eyes.zw, u_eyeRadii.y, be, aspect);
+          wuv = warpEye(wuv, u_eyes.xy, u_eyeRadii.x, bigEyesAmt * wL, aspect);
+          wuv = warpEye(wuv, u_eyes.zw, u_eyeRadii.y, bigEyesAmt * wR, aspect);
         }
         if (abs(eyeTiltAmt) > 0.001) {
-          float et = eyeTiltAmt * wFade;
-          vec2 shiftL = faceUp * (u_eyeRadii.x * 0.28 * et);
-          vec2 shiftR = faceUp * (u_eyeRadii.y * 0.28 * et);
+          vec2 shiftL = upUv * (u_eyeRadii.x * 0.28 * eyeTiltAmt * wL);
+          vec2 shiftR = upUv * (u_eyeRadii.y * 0.28 * eyeTiltAmt * wR);
           wuv = warpPush(wuv, u_eyeOuter.xy, u_eyeOuter.xy + shiftL, max(u_eyeRadii.x * 0.85, 0.015), 0.9, aspect);
           wuv = warpPush(wuv, u_eyeOuter.zw, u_eyeOuter.zw + shiftR, max(u_eyeRadii.y * 0.85, 0.015), 0.9, aspect);
         }
         float effCheek = clamp(slimCheekAmt + slimFaceAmt * 0.22, 0.0, 1.0);
         if (effCheek > 0.001) {
-          float sc = effCheek * wFade;
           float rCheek = max(fw * 0.44, 0.02);
-          wuv = warpPush(wuv, u_leftContour.xy,  noseTip, rCheek, sc * 0.24, aspect);
-          wuv = warpPush(wuv, u_rightContour.xy, noseTip, rCheek, sc * 0.24, aspect);
+          wuv = warpPush(wuv, u_leftContour.xy,  noseTip, rCheek, effCheek * wL * 0.24, aspect);
+          wuv = warpPush(wuv, u_rightContour.xy, noseTip, rCheek, effCheek * wR * 0.24, aspect);
         }
         if (slimFaceAmt > 0.001) {
-          float sf = slimFaceAmt * wFade;
           float rJaw = max(fw * 0.48, 0.02);
           vec2 jawTarget = mix(noseTip, chinPt, 0.55);
-          wuv = warpPush(wuv, u_leftContour.zw,  jawTarget, rJaw, sf * 0.28, aspect);
-          wuv = warpPush(wuv, u_rightContour.zw, jawTarget, rJaw, sf * 0.28, aspect);
+          wuv = warpPush(wuv, u_leftContour.zw,  jawTarget, rJaw, slimFaceAmt * wL * 0.28, aspect);
+          wuv = warpPush(wuv, u_rightContour.zw, jawTarget, rJaw, slimFaceAmt * wR * 0.28, aspect);
         }
         if (abs(vChinAmt) > 0.001) {
-          float vc = vChinAmt * wFade;
-          vec2 chinTarget = chinPt - faceUp * (fh * 0.075 * vc);
+          vec2 chinTarget = chinPt - upUv * (fh * 0.075 * vChinAmt * wCenter);
           wuv = warpPush(wuv, chinPt, chinTarget, max(fw * 0.36, 0.02), 0.85, aspect);
         }
         if (slimNoseAmt > 0.001) {
-          float sn = slimNoseAmt * wFade;
           float rNose = max(fw * 0.19, 0.015);
-          wuv = warpPush(wuv, u_noseWings.xy, noseTip, rNose, sn * 0.34, aspect);
-          wuv = warpPush(wuv, u_noseWings.zw, noseTip, rNose, sn * 0.34, aspect);
+          wuv = warpPush(wuv, u_noseWings.xy, noseTip, rNose, slimNoseAmt * wL * 0.34, aspect);
+          wuv = warpPush(wuv, u_noseWings.zw, noseTip, rNose, slimNoseAmt * wR * 0.34, aspect);
         }
         if (abs(mouthSizeAmt) > 0.001) {
-          wuv = warpEye(wuv, u_chinMouth.zw, max(fw * 0.24, 0.02), mouthSizeAmt * 0.65 * wFade, aspect);
+          wuv = warpEye(wuv, u_chinMouth.zw, max(fw * 0.24, 0.02), mouthSizeAmt * 0.65 * wCenter, aspect);
         }
         if (mouthSmileAmt > 0.001) {
-          float ms = mouthSmileAmt * wFade;
-          vec2 lift = faceUp * (fh * 0.042 * ms);
           float rMouth = max(fw * 0.14, 0.015);
-          wuv = warpPush(wuv, u_mouthCorners.xy, u_mouthCorners.xy + lift, rMouth, 0.9, aspect);
-          wuv = warpPush(wuv, u_mouthCorners.zw, u_mouthCorners.zw + lift, rMouth, 0.9, aspect);
+          vec2 liftL = upUv * (fh * 0.042 * mouthSmileAmt * wL);
+          vec2 liftR = upUv * (fh * 0.042 * mouthSmileAmt * wR);
+          wuv = warpPush(wuv, u_mouthCorners.xy, u_mouthCorners.xy + liftL, rMouth, 0.9, aspect);
+          wuv = warpPush(wuv, u_mouthCorners.zw, u_mouthCorners.zw + liftR, rMouth, 0.9, aspect);
         }
         wuv = clamp(wuv, vec2(0.0), vec2(1.0));
       }
@@ -996,20 +1095,25 @@
       vec4 orig = texture2D(u_video, wuv);
       vec3 rgb = orig.rgb;
 
-      vec4 maskTex = (u_hasFaceMask > 0.5) ? texture2D(u_mask, wuv) : vec4(0.0);
+      vec2 maskUv = (wuv - u_maskRect.xy) * u_maskRect.zw;
+      float inMask = step(0.0, maskUv.x) * step(maskUv.x, 1.0) * step(0.0, maskUv.y) * step(maskUv.y, 1.0);
+      vec4 maskTex = (u_hasFaceMask > 0.5 && inMask > 0.5) ? texture2D(u_mask, maskUv) : vec4(0.0);
       float faceSkinMask = maskTex.r;
       float eyeMask = maskTex.g;
       float lipMask = maskTex.b;
 
+      float origLuma = dot(orig.rgb, vec3(0.299, 0.587, 0.114));
       float skinW = skinProbability(orig.rgb);
-      float skinArea = (u_hasFaceMask > 0.5) ? (faceSkinMask * mix(0.45, 1.0, skinW)) : (skinW * 0.85);
+      float hairProtect = smoothstep(0.06, 0.22, origLuma);
+      float skinGate = mix(0.22 * hairProtect, 1.0, clamp(skinW * 1.15, 0.0, 1.0));
+      float skinArea = (u_hasFaceMask > 0.5) ? (faceSkinMask * skinGate) : (skinW * 0.85);
 
       float ueW = 0.0;
       float nlW = 0.0;
       if (u_hasFaceMask > 0.5 && faceSkinMask > 0.01 && faceFade > 0.001) {
         if (underEyeAmt > 0.001) {
-          float ueL = underEyeMask(wuv, u_eyes.xy, u_eyeRadii.x, aspect);
-          float ueR = underEyeMask(wuv, u_eyes.zw, u_eyeRadii.y, aspect);
+          float ueL = underEyeMask(wuv, u_eyes.xy, u_eyeRadii.x, aspect, rightA, upA);
+          float ueR = underEyeMask(wuv, u_eyes.zw, u_eyeRadii.y, aspect, rightA, upA);
           ueW = max(ueL, ueR) * faceSkinMask;
         }
         if (nasolabialAmt > 0.001 && u_eyeRadii.z > 0.01) {
@@ -1096,19 +1200,21 @@
         rgb = clamp(eyeBright, 0.0, 1.0);
       }
 
-      if (u_hasFaceMask > 0.5 && teethAmt > 0.001 && faceFade > 0.001 && u_eyeRadii.z > 0.01) {
-        vec2 dm = wuv - u_chinMouth.zw;
-        dm.x *= aspect;
-        float mouthZone = (1.0 - smoothstep(u_eyeRadii.z * 0.06, u_eyeRadii.z * 0.18, length(dm))) * (1.0 - faceSkinMask * 0.8);
-        if (mouthZone > 0.05) {
+      if (u_hasFaceMask > 0.5 && teethAmt > 0.001 && faceFade > 0.001 && mouthHalfW > 0.005) {
+        vec2 dmA = vec2((wuv.x - u_chinMouth.z) * aspect, wuv.y - u_chinMouth.w);
+        float mx = dot(dmA, rightA) / max(mouthHalfW * 0.92, 0.006);
+        float my = dot(dmA, upA) / max(mouthHalfW * 0.62, 0.005);
+        float mouthEnv = 1.0 - smoothstep(0.60, 1.05, mx * mx + my * my);
+        float innerMouth = mouthEnv * clamp(1.0 - faceSkinMask * 1.6, 0.0, 1.0) * clamp(1.0 - lipMask * 1.8, 0.0, 1.0);
+        if (innerMouth > 0.05) {
           float luma = dot(rgb, vec3(0.299, 0.587, 0.114));
           float maxC = max(rgb.r, max(rgb.g, rgb.b));
           float minC = min(rgb.r, min(rgb.g, rgb.b));
           float redExcess = rgb.r - rgb.b;
-          float isTooth = smoothstep(0.42, 0.65, luma) * (1.0 - smoothstep(0.14, 0.28, redExcess)) * (1.0 - smoothstep(0.18, 0.34, maxC - minC));
-          float tAmt = isTooth * mouthZone * teethAmt * 0.65 * faceFade;
+          float isTooth = smoothstep(0.38, 0.62, luma) * (1.0 - smoothstep(0.14, 0.28, redExcess)) * (1.0 - smoothstep(0.18, 0.34, maxC - minC));
+          float tAmt = isTooth * innerMouth * teethAmt * 0.70 * faceFade;
           if (tAmt > 0.01) {
-            vec3 cleanWhite = mix(rgb, vec3(min(1.0, luma * 1.12 + 0.08)), 0.72);
+            vec3 cleanWhite = mix(rgb, vec3(min(1.0, luma * 1.12 + 0.08)), 0.74);
             rgb = clamp(mix(rgb, cleanWhite, tAmt), 0.0, 1.0);
           }
         }
@@ -1231,21 +1337,35 @@
       this.gl = null;
       this.program = null;
       this.videoTex = null;
+      this.pendingTex = null;
       this.maskTex = null;
       this.posBuf = null;
       this.uniforms = {};
       this.contextLost = false;
+      this.frameSeq = 0;
+      this.pendingFrameId = 0;
+      this.pendingMediaTime = 0;
+      this.hasCommittedFrame = false;
+      this.lastInferMs = 0;
 
       this.maskCanvas = document.createElement("canvas");
-      this.maskCanvas.width = 320;
-      this.maskCanvas.height = 320;
+      this.maskCanvas.width = 256;
+      this.maskCanvas.height = 256;
       this.maskCtx = this.maskCanvas.getContext("2d");
+      this.maskRect = [0, 0, 1, 1];
 
       this.inferCanvas = document.createElement("canvas");
       this.inferCtx = this.inferCanvas.getContext("2d", { willReadFrequently: false });
 
+      this.sceneCanvas = document.createElement("canvas");
+      this.sceneCanvas.width = 8;
+      this.sceneCanvas.height = 6;
+      this.sceneCtx = this.sceneCanvas.getContext("2d", { willReadFrequently: true });
+      this.prevSceneLuma = null;
+
       this.worker = null;
       this.workerBlobUrl = null;
+      this.workerDelegatePref = "GPU";
       this.mainTracker = null;
       this.workerStatus = this.faceTrackingEnabled ? "待启动" : "肤色直出模式（未开478点）";
       this.workerReady = false;
@@ -1255,8 +1375,20 @@
       this.lastInferSentMs = 0;
       this.latestLandmarks = null;
       this.latestLandmarkTs = 0;
+      this.latestLandmarkRecvTs = 0;
+      this.lastFaceBox = null;
       this.validFaceStreak = 0;
+      this.missStreak = 0;
+      this.scanStep = 0;
+      this.pendingSceneCut = false;
+      this.pendingRedispatch = false;
+      this.hasNewVideoFrame = false;
       this.fadeWeight = 1.0;
+      this.reshapeGate = 1.0;
+      this.inferMsEma = 14;
+      this.adaptiveInferEdge = IS_IOS_OR_MOBILE ? 384 : 512;
+      this.lastGeomCheckMs = 0;
+      this.lastGeomSig = "";
 
       this.rvfcHandle = null;
       this.rafHandle = null;
@@ -1508,8 +1640,10 @@
       on("seeked", () => {
         this.resetTrackingAndFade();
         if ((this.enabled || this.theaterActive) && this.captureStatus === "ready") {
-          this.renderSingleFrame(performance.now(), { skipInfer: true });
-          this.maybeDispatchInference(performance.now(), true);
+          this.renderSingleFrame(performance.now(), { skipInfer: true, forceUpload: true });
+          if (this.workerReady && !this.maybeDispatchInference(performance.now(), true)) {
+            this.pendingRedispatch = true;
+          }
         } else if (!this.enabled && this.protectionSignal === "none") {
           this.runProtectionAndProbe();
         }
@@ -1525,7 +1659,10 @@
       on("pause", () => {
         this.stopFrameLoop();
         if ((this.enabled || this.theaterActive) && this.captureStatus === "ready") {
-          this.renderSingleFrame(performance.now(), { skipInfer: true });
+          this.renderSingleFrame(performance.now(), { skipInfer: true, forceUpload: !this.hasCommittedFrame });
+          if (this.workerReady && !this.maybeDispatchInference(performance.now(), true)) {
+            this.pendingRedispatch = true;
+          }
         }
       });
       on("ended", () => this.stopFrameLoop());
@@ -1582,10 +1719,22 @@
     resetTrackingAndFade() {
       this.latestLandmarks = null;
       this.latestLandmarkTs = 0;
+      this.latestLandmarkRecvTs = 0;
       this.faceAnchors = null;
+      this.lastFaceBox = null;
+      this.prevSceneLuma = null;
       this.validFaceStreak = 0;
+      this.missStreak = 0;
+      this.scanStep = 0;
+      this.pendingSceneCut = false;
+      this.pendingRedispatch = false;
+      this.hasNewVideoFrame = false;
       this.fadeWeight = this.workerReady ? 0.0 : 1.0;
+      this.reshapeGate = 1.0;
+      this.maskRect = [0, 0, 1, 1];
       this.lastMediaTime = -1;
+      this.hasCommittedFrame = false;
+      this.pendingFrameId = 0;
       if (this.worker) this.worker.postMessage({ type: "RESET" });
       if (this.mainTracker) this.mainTracker.reset();
     }
@@ -1863,7 +2012,10 @@
       gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
 
       this.videoTex = this.createLinearTexture(gl);
+      this.pendingTex = this.createLinearTexture(gl);
       this.maskTex = this.createLinearTexture(gl);
+      this.hasCommittedFrame = false;
+      this.pendingFrameId = 0;
 
       const u = (n) => gl.getUniformLocation(this.program, n);
       this.uniforms = {
@@ -1881,6 +2033,8 @@
         u_lipColor: u("u_lipColor"),
         u_colorA: u("u_colorA"),
         u_colorB: u("u_colorB"),
+        u_maskRect: u("u_maskRect"),
+        u_yawVis: u("u_yawVis"),
         u_eyes: u("u_eyes"),
         u_eyeOuter: u("u_eyeOuter"),
         u_eyeRadii: u("u_eyeRadii"),
@@ -1894,6 +2048,8 @@
       gl.uniform1i(this.uniforms.u_video, 0);
       gl.uniform1i(this.uniforms.u_mask, 1);
       gl.uniform4f(this.uniforms.u_uvTransform, 1, 1, 0, 0);
+      gl.uniform4f(this.uniforms.u_maskRect, 0, 0, 1, 1);
+      gl.uniform4f(this.uniforms.u_yawVis, 1, 1, 1, 0.05);
       return true;
     }
 
@@ -1922,40 +2078,97 @@
       this.canvas = null; this.gl = null;
       if (oldGl) {
         if (this.videoTex) oldGl.deleteTexture(this.videoTex);
+        if (this.pendingTex) oldGl.deleteTexture(this.pendingTex);
         if (this.maskTex) oldGl.deleteTexture(this.maskTex);
         if (this.posBuf) oldGl.deleteBuffer(this.posBuf);
         if (this.program) oldGl.deleteProgram(this.program);
         const ext = oldGl.getExtension("WEBGL_lose_context");
         if (ext) ext.loseContext();
       }
-      this.program = null; this.videoTex = null; this.maskTex = null; this.posBuf = null;
+      this.program = null; this.videoTex = null; this.pendingTex = null; this.maskTex = null; this.posBuf = null;
+      this.hasCommittedFrame = false; this.pendingFrameId = 0;
       if (oldCanvas && oldCanvas.parentElement) oldCanvas.parentElement.removeChild(oldCanvas);
     }
 
-    computeContentRect(video) {
+    parseCssTransform2D(str) {
+      if (!str || str === "none") return null;
+      const m2 = str.match(/^matrix\(([^)]+)\)$/);
+      if (m2) {
+        const p = m2[1].split(",").map((s) => parseFloat(s.trim()));
+        if (p.length === 6 && p.every(Number.isFinite)) return { a: p[0], b: p[1], c: p[2], d: p[3], tx: p[4], ty: p[5] };
+      }
+      const m3 = str.match(/^matrix3d\(([^)]+)\)$/);
+      if (m3) {
+        const p = m3[1].split(",").map((s) => parseFloat(s.trim()));
+        if (p.length === 16 && p.every(Number.isFinite)) return { a: p[0], b: p[1], c: p[4], d: p[5], tx: p[12], ty: p[13] };
+      }
+      return null;
+    }
+
+    evalObjectPosAxis(token, freeSpace) {
+      if (!token) return freeSpace * 0.5;
+      const t = token.trim().toLowerCase();
+      if (t === "left" || t === "top") return 0;
+      if (t === "center") return freeSpace * 0.5;
+      if (t === "right" || t === "bottom") return freeSpace;
+      if (t.endsWith("%")) {
+        const pct = parseFloat(t);
+        return Number.isFinite(pct) ? (pct / 100) * freeSpace : freeSpace * 0.5;
+      }
+      const px = parseFloat(t);
+      return Number.isFinite(px) ? px : freeSpace * 0.5;
+    }
+
+    computeContentRect(video, boxWOverride, boxHOverride) {
       const win = (video.ownerDocument && video.ownerDocument.defaultView) || window;
+      const vStyle = win.getComputedStyle(video);
       const vRect = video.getBoundingClientRect();
-      const vw = video.videoWidth || vRect.width;
-      const vh = video.videoHeight || vRect.height;
-      const cw = vRect.width;
-      const ch = vRect.height;
-      if (!vw || !vh || !cw || !ch) return { x: 0, y: 0, width: cw, height: ch, uvTransform: [1, 1, 0, 0] };
-      const fit = win.getComputedStyle(video).objectFit || "contain";
+      const insetX = (parseFloat(vStyle.borderLeftWidth) || 0) + (parseFloat(vStyle.paddingLeft) || 0);
+      const insetY = (parseFloat(vStyle.borderTopWidth) || 0) + (parseFloat(vStyle.paddingTop) || 0);
+      const rawW = boxWOverride > 0 ? boxWOverride : vRect.width;
+      const rawH = boxHOverride > 0 ? boxHOverride : vRect.height;
+      const cw = Math.max(1, rawW - insetX - (parseFloat(vStyle.borderRightWidth) || 0) - (parseFloat(vStyle.paddingRight) || 0));
+      const ch = Math.max(1, rawH - insetY - (parseFloat(vStyle.borderBottomWidth) || 0) - (parseFloat(vStyle.paddingBottom) || 0));
+      const vw = video.videoWidth || cw;
+      const vh = video.videoHeight || ch;
+      if (!vw || !vh || !cw || !ch) return { x: insetX, y: insetY, width: cw, height: ch, uvTransform: [1, 1, 0, 0] };
+
+      const fit = vStyle.objectFit || "contain";
+      const posTokens = (vStyle.objectPosition || "50% 50%").trim().split(/\s+/);
+      const posXTok = posTokens[0] || "50%";
+      const posYTok = posTokens[1] || posXTok;
       const vr = vw / vh;
       const br = cw / ch;
-      if (fit === "fill") return { x: 0, y: 0, width: cw, height: ch, uvTransform: [1, 1, 0, 0] };
+
+      if (fit === "fill") return { x: insetX, y: insetY, width: cw, height: ch, uvTransform: [1, 1, 0, 0] };
       if (fit === "cover") {
-        let sx = 1, sy = 1;
-        if (vr > br) sx = br / vr;
-        else sy = vr / br;
-        return { x: 0, y: 0, width: cw, height: ch, uvTransform: [sx, sy, (1 - sx) * 0.5, (1 - sy) * 0.5] };
+        const renderW = vr > br ? ch * vr : cw;
+        const renderH = vr > br ? ch : cw / vr;
+        const offX = this.evalObjectPosAxis(posXTok, cw - renderW);
+        const offY = this.evalObjectPosAxis(posYTok, ch - renderH);
+        const sx = Math.min(1, cw / Math.max(renderW, 1e-4));
+        const sy = Math.min(1, ch / Math.max(renderH, 1e-4));
+        const ox = Math.max(0, Math.min(1 - sx, -offX / Math.max(renderW, 1e-4)));
+        const oy = Math.max(0, Math.min(1 - sy, -offY / Math.max(renderH, 1e-4)));
+        return { x: insetX, y: insetY, width: cw, height: ch, uvTransform: [sx, sy, ox, oy] };
       }
-      if (vr > br) {
-        const rh = cw / vr;
-        return { x: 0, y: (ch - rh) / 2, width: cw, height: rh, uvTransform: [1, 1, 0, 0] };
+      if (fit === "none" || (fit === "scale-down" && vw <= cw && vh <= ch)) {
+        const offX = this.evalObjectPosAxis(posXTok, cw - vw);
+        const offY = this.evalObjectPosAxis(posYTok, ch - vh);
+        const visL = Math.max(0, offX), visT = Math.max(0, offY);
+        const visW = Math.max(1, Math.min(cw, offX + vw) - visL);
+        const visH = Math.max(1, Math.min(ch, offY + vh) - visT);
+        return { x: insetX + visL, y: insetY + visT, width: visW, height: visH, uvTransform: [visW / vw, visH / vh, Math.max(0, (visL - offX) / vw), Math.max(0, (visT - offY) / vh)] };
       }
-      const rw = ch * vr;
-      return { x: (cw - rw) / 2, y: 0, width: rw, height: ch, uvTransform: [1, 1, 0, 0] };
+      const renderW = vr > br ? cw : ch * vr;
+      const renderH = vr > br ? cw / vr : ch;
+      return {
+        x: insetX + this.evalObjectPosAxis(posXTok, cw - renderW),
+        y: insetY + this.evalObjectPosAxis(posYTok, ch - renderH),
+        width: renderW,
+        height: renderH,
+        uvTransform: [1, 1, 0, 0],
+      };
     }
 
     syncCanvasGeometry() {
@@ -2021,7 +2234,8 @@
 
       const parent = this.canvas.parentElement;
       if (!parent) return;
-      const vZ = parseInt(win.getComputedStyle(this.video).zIndex, 10);
+      const vStyle = win.getComputedStyle(this.video);
+      const vZ = parseInt(vStyle.zIndex, 10);
       this.canvas.style.setProperty("z-index", String(Number.isFinite(vZ) ? Math.max(2, vZ + 1) : 2), "important");
       if (win.getComputedStyle(parent).position === "static") parent.style.position = "relative";
 
@@ -2030,25 +2244,57 @@
       const opStyle = win.getComputedStyle(offsetParent);
       const borderL = parseFloat(opStyle.borderLeftWidth) || 0;
       const borderT = parseFloat(opStyle.borderTopWidth) || 0;
-      const vRect = this.video.getBoundingClientRect();
-      const content = this.computeContentRect(this.video);
-      this.uvTransform = content.uvTransform;
+      const opScaleX = offsetParent.offsetWidth > 0 ? opRect.width / offsetParent.offsetWidth : 1;
+      const opScaleY = offsetParent.offsetHeight > 0 ? opRect.height / offsetParent.offsetHeight : 1;
+      const safeScaleX = opScaleX > 0.05 ? opScaleX : 1;
+      const safeScaleY = opScaleY > 0.05 ? opScaleY : 1;
 
-      this.canvas.style.setProperty("left", `${vRect.left - opRect.left - borderL + content.x}px`, "important");
-      this.canvas.style.setProperty("top", `${vRect.top - opRect.top - borderT + content.y}px`, "important");
-      this.canvas.style.setProperty("width", `${content.width}px`, "important");
-      this.canvas.style.setProperty("height", `${content.height}px`, "important");
+      const vRect = this.video.getBoundingClientRect();
+      const mat = this.parseCssTransform2D(vStyle.transform);
+      const hasRotation = !!(mat && (Math.abs(mat.b) > 1e-3 || Math.abs(mat.c) > 1e-3));
+      const flipX = mat && !hasRotation && mat.a < 0 ? -1 : 1;
+      const flipY = mat && !hasRotation && mat.d < 0 ? -1 : 1;
+
+      let left, top, cssW, cssH;
+      let canvasTransform = "translateZ(0)";
+      if (hasRotation && this.video.offsetWidth > 0 && this.video.offsetHeight > 0) {
+        const content = this.computeContentRect(this.video, this.video.offsetWidth, this.video.offsetHeight);
+        this.uvTransform = content.uvTransform;
+        const centerX = (vRect.left + vRect.width * 0.5 - opRect.left) / safeScaleX - borderL;
+        const centerY = (vRect.top + vRect.height * 0.5 - opRect.top) / safeScaleY - borderT;
+        cssW = content.width; cssH = content.height;
+        left = centerX - cssW * 0.5; top = centerY - cssH * 0.5;
+        canvasTransform = `matrix(${mat.a}, ${mat.b}, ${mat.c}, ${mat.d}, 0, 0) translateZ(0)`;
+      } else {
+        const localW = vRect.width / safeScaleX;
+        const localH = vRect.height / safeScaleY;
+        const content = this.computeContentRect(this.video, localW, localH);
+        this.uvTransform = content.uvTransform;
+        const cx = flipX < 0 ? localW - content.x - content.width : content.x;
+        const cy = flipY < 0 ? localH - content.y - content.height : content.y;
+        left = (vRect.left - opRect.left) / safeScaleX - borderL + cx;
+        top = (vRect.top - opRect.top) / safeScaleY - borderT + cy;
+        cssW = content.width; cssH = content.height;
+        if (flipX < 0 || flipY < 0) canvasTransform = `scale(${flipX}, ${flipY}) translateZ(0)`;
+      }
+
+      this.canvas.style.setProperty("left", `${left}px`, "important");
+      this.canvas.style.setProperty("top", `${top}px`, "important");
+      this.canvas.style.setProperty("width", `${cssW}px`, "important");
+      this.canvas.style.setProperty("height", `${cssH}px`, "important");
+      this.canvas.style.setProperty("transform", canvasTransform, "important");
+      this.lastGeomSig = `${Math.round(vRect.left * 2)},${Math.round(vRect.top * 2)},${Math.round(vRect.width * 2)},${Math.round(vRect.height * 2)},${Math.round(opRect.left * 2)},${Math.round(opRect.top * 2)},${this.video.videoWidth}x${this.video.videoHeight},${vStyle.objectFit},${vStyle.objectPosition},${vStyle.transform}`;
 
       const dprCap = IS_IOS_OR_MOBILE ? 1.25 : 1.5;
       const dpr = Math.min(win.devicePixelRatio || 1, dprCap);
-      const isPortrait = content.height > content.width;
+      const isPortrait = cssH > cssW;
       const longMax = this.degradeTier === "L2" || IS_IOS_OR_MOBILE ? 1280 : 1920;
       const shortMax = this.degradeTier === "L2" || IS_IOS_OR_MOBILE ? 720 : 1080;
       const maxW = isPortrait ? shortMax : longMax;
       const maxH = isPortrait ? longMax : shortMax;
 
-      const targetW = Math.max(2, Math.min(Math.round(content.width * dpr), this.video.videoWidth || maxW, maxW));
-      const targetH = Math.max(2, Math.min(Math.round(content.height * dpr), this.video.videoHeight || maxH, maxH));
+      const targetW = Math.max(2, Math.min(Math.round(cssW * safeScaleX * dpr), this.video.videoWidth || maxW, maxW));
+      const targetH = Math.max(2, Math.min(Math.round(cssH * safeScaleY * dpr), this.video.videoHeight || maxH, maxH));
 
       if (this.canvas.width !== targetW || this.canvas.height !== targetH) {
         this.canvas.width = targetW;
@@ -2057,6 +2303,21 @@
           this.renderSingleFrame(performance.now(), { skipInfer: true });
         }
       }
+    }
+
+    maybeSyncGeometryThrottled(nowMs) {
+      if (this.theaterActive || !this.canvas || !this.video || nowMs - this.lastGeomCheckMs < 200) return;
+      this.lastGeomCheckMs = nowMs;
+      const doc = this.video.ownerDocument || document;
+      const win = doc.defaultView || window;
+      const parent = this.canvas.parentElement;
+      if (!parent) return;
+      const offsetParent = this.canvas.offsetParent || this.findPositionedAncestor(parent, win);
+      const opRect = offsetParent.getBoundingClientRect();
+      const vRect = this.video.getBoundingClientRect();
+      const vStyle = win.getComputedStyle(this.video);
+      const sig = `${Math.round(vRect.left * 2)},${Math.round(vRect.top * 2)},${Math.round(vRect.width * 2)},${Math.round(vRect.height * 2)},${Math.round(opRect.left * 2)},${Math.round(opRect.top * 2)},${this.video.videoWidth}x${this.video.videoHeight},${vStyle.objectFit},${vStyle.objectPosition},${vStyle.transform}`;
+      if (sig !== this.lastGeomSig) this.syncCanvasGeometry();
     }
 
     handleFullscreenChange() {
@@ -2077,14 +2338,15 @@
       }
     }
 
-    async ensureFaceTracking() {
+    async ensureFaceTracking(preferredDelegate = this.workerDelegatePref || "GPU") {
       if (!this.faceTrackingEnabled) {
         this.workerStatus = "肤色直出模式（未开478点）";
         return;
       }
       if (this.worker || this.mainTracker || this.workerInitializing || this.workerUnavailable) return;
       this.workerInitializing = true;
-      this.workerStatus = "正在加载 478 点模型…";
+      this.workerDelegatePref = preferredDelegate;
+      this.workerStatus = preferredDelegate === "CPU" ? "正在加载 478 点模型 (CPU)…" : "正在加载 478 点模型…";
 
       const fallbackToMainThread = async (workerReason) => {
         if (!this.enabled || !this.faceTrackingEnabled || this.destroyed) {
@@ -2130,31 +2392,105 @@
           if (msg.type === "READY") {
             this.workerReady = true;
             this.workerInitializing = false;
-            this.workerStatus = `就绪 (${msg.delegate} Worker)`;
-            if (this.enabled && this.captureStatus === "ready" && this.video && this.video.paused) {
+            this.workerStatus = `就绪 (${msg.delegate} · 零滞后帧同步)`;
+            if (this.enabled && this.captureStatus === "ready" && this.video) {
               this.maybeDispatchInference(performance.now(), true);
             }
             this.onChange();
+          } else if (msg.type === "FALLBACK_CPU") {
+            this.terminateFaceTracking(true, true);
+            if (this.enabled && this.faceTrackingEnabled && !this.destroyed) {
+              this.ensureFaceTracking("CPU");
+            }
           } else if (msg.type === "UNAVAILABLE") {
             this.terminateFaceTracking(true);
             fallbackToMainThread(msg.reason);
           } else if (msg.type === "RESULT") {
             this.workerBusy = false;
             this.detectFrameCount++;
+            if (typeof msg.inferMs === "number" && Number.isFinite(msg.inferMs)) {
+              this.lastInferMs = msg.inferMs;
+              this.inferMsEma = this.inferMsEma * 0.8 + msg.inferMs * 0.2;
+              if (this.degradeTier === "L0") {
+                const maxCap = IS_IOS_OR_MOBILE ? 416 : 576;
+                const minCap = IS_IOS_OR_MOBILE ? 288 : 352;
+                if (this.inferMsEma > 28 && this.adaptiveInferEdge > minCap) {
+                  this.adaptiveInferEdge = Math.max(minCap, this.adaptiveInferEdge - 32);
+                } else if (this.inferMsEma < 14 && this.adaptiveInferEdge < maxCap) {
+                  this.adaptiveInferEdge = Math.min(maxCap, this.adaptiveInferEdge + 16);
+                }
+              }
+            }
+            const recvNow = performance.now();
+
+            if (!msg.frameId || msg.frameId !== this.pendingFrameId) {
+              if (this.enabled && this.captureStatus === "ready" && (this.pendingRedispatch || (this.hasNewVideoFrame && this.video && !this.video.paused))) {
+                const force = this.pendingRedispatch;
+                this.pendingRedispatch = false;
+                this.hasNewVideoFrame = false;
+                this.maybeDispatchInference(recvNow, force);
+              }
+              return;
+            }
+
+            if (this.pendingTex && this.videoTex) {
+              const tmp = this.videoTex;
+              this.videoTex = this.pendingTex;
+              this.pendingTex = tmp;
+              this.hasCommittedFrame = true;
+              this.lastCapturedMediaTime = this.pendingMediaTime;
+            }
+
             if (msg.hasFace && msg.landmarks) {
               this.latestLandmarks = msg.landmarks;
-              this.latestLandmarkTs = performance.now();
+              this.latestLandmarkTs = Number.isFinite(msg.timestampMs) ? msg.timestampMs : recvNow;
+              this.latestLandmarkRecvTs = recvNow;
+              this.lastFaceBox = msg.faceBox || null;
               this.validFaceStreak = Math.min(this.validFaceStreak + 1, 10);
-              if (this.enabled && this.captureStatus === "ready" && this.video && this.video.paused) {
-                this.validFaceStreak = Math.max(this.validFaceStreak, 2);
-                this.fadeWeight = 1.0;
-                this.renderSingleFrame(performance.now(), { skipInfer: true });
-              }
+              this.missStreak = 0;
+              this.scanStep = 0;
+              this.fadeWeight = 1.0;
+              this.reshapeGate = 1.0;
             } else {
-              this.validFaceStreak = 0;
+              const wasCropped = !!(msg.roiUsed && (msg.roiUsed.w < 0.99 || msg.roiUsed.h < 0.99));
+              if (wasCropped) this.lastFaceBox = null;
+              if (this.pendingSceneCut || !this.latestLandmarks || this.missStreak >= 3) {
+                this.latestLandmarks = null;
+                this.lastFaceBox = null;
+                this.validFaceStreak = 0;
+                this.missStreak = 0;
+                this.fadeWeight = 0.0;
+                this.reshapeGate = 0.0;
+              } else {
+                this.missStreak++;
+                this.fadeWeight = Math.max(0.18, 1.0 - this.missStreak * 0.27);
+                this.reshapeGate = Math.max(0.0, 1.0 - this.missStreak * 0.5);
+              }
+            }
+            this.pendingSceneCut = false;
+
+            if ((this.enabled || this.theaterActive) && this.captureStatus === "ready" && this.gl && !this.contextLost && this.hasCommittedFrame) {
+              this.maybeSyncGeometryThrottled(recvNow);
+              const hasFaceMask = this.enabled ? this.updateFaceMaskTexture(recvNow) : false;
+              this.drawCommittedVideoTex(hasFaceMask, recvNow);
+            }
+
+            if (this.enabled && this.captureStatus === "ready" && this.video) {
+              if (this.pendingRedispatch) {
+                this.pendingRedispatch = false;
+                this.hasNewVideoFrame = false;
+                this.maybeDispatchInference(performance.now(), true);
+              } else if (this.hasNewVideoFrame && !this.video.paused && !this.video.ended) {
+                this.hasNewVideoFrame = false;
+                this.maybeDispatchInference(performance.now(), false);
+              }
             }
           } else if (msg.type === "ERROR" || msg.type === "NO_MODEL") {
             this.workerBusy = false;
+            if (this.pendingRedispatch) {
+              this.pendingRedispatch = false;
+              this.maybeDispatchInference(performance.now(), true);
+            }
           }
         };
         w.onerror = () => {
@@ -2162,7 +2498,7 @@
           this.terminateFaceTracking(true);
           fallbackToMainThread("Worker 受 CSP/Safari 限制");
         };
-        w.postMessage({ type: "INIT", bundleUrl: MP_BUNDLE_URL, wasmDir: MP_WASM_DIR, modelUrl: MP_MODEL_URL });
+        w.postMessage({ type: "INIT", bundleUrl: MP_BUNDLE_URL, wasmDir: MP_WASM_DIR, modelUrl: MP_MODEL_URL, delegate: preferredDelegate });
       } catch (err) {
         this.terminateFaceTracking(true);
         fallbackToMainThread(err && err.message);
@@ -2201,78 +2537,191 @@
       try { oldW.postMessage({ type: "CLOSE" }); } catch (_) { clean(); }
     }
 
-    maybeDispatchInference(nowMs, force = false) {
-      if (!this.enabled || !this.workerReady || (!this.worker && !this.mainTracker) || this.workerBusy || !this.video) return;
-      const minIntervalMs = this.mainTracker ? 125 : IS_IOS_OR_MOBILE ? 90 : this.degradeTier === "L0" ? 55 : 95;
-      if (!force && nowMs - this.lastInferSentMs < minIntervalMs) return;
+    detectSceneCut(frameSource) {
+      try {
+        this.sceneCtx.drawImage(frameSource, 0, 0, 8, 6);
+        const data = this.sceneCtx.getImageData(0, 0, 8, 6).data;
+        const curr = new Uint8Array(48);
+        for (let i = 0; i < 48; i++) {
+          const o = i * 4;
+          curr[i] = (data[o] * 77 + data[o + 1] * 150 + data[o + 2] * 29) >> 8;
+        }
+        let isCut = false;
+        if (this.prevSceneLuma) {
+          let sad = 0;
+          for (let i = 0; i < 48; i++) sad += Math.abs(curr[i] - this.prevSceneLuma[i]);
+          if (sad / 48 > 30) isCut = true;
+        }
+        this.prevSceneLuma = curr;
+        return isCut;
+      } catch (_) {
+        return false;
+      }
+    }
 
-      const maxEdge = IS_IOS_OR_MOBILE ? 256 : this.degradeTier === "L0" ? 384 : 288;
+    computeInferRoi(vw, vh, isSceneCut) {
+      if (isSceneCut) {
+        this.lastFaceBox = null;
+        this.scanStep = 0;
+        return { x: 0, y: 0, w: 1, h: 1, isSmallCrop: false };
+      }
+      const aspect = vw / Math.max(1, vh);
+      const box = this.lastFaceBox;
+      if (box && (box.w < 0.26 || box.h < 0.36)) {
+        const faceSizeA = Math.max(box.w * aspect, box.h, 0.08);
+        const cropA = Math.max(0.32, Math.min(0.95, faceSizeA * 3.1));
+        const rw = Math.min(1.0, cropA / aspect);
+        const rh = Math.min(1.0, cropA);
+        if (rw < 0.88 || rh < 0.88) {
+          const rx = Math.max(0, Math.min(1 - rw, box.cx - rw * 0.5));
+          const ry = Math.max(0, Math.min(1 - rh, box.cy - rh * 0.5));
+          return { x: rx, y: ry, w: rw, h: rh, isSmallCrop: true };
+        }
+      }
+      if (!box) {
+        const step = this.scanStep++;
+        if (step % 2 === 1) {
+          const win = SMALL_FACE_SCAN_ROIS[Math.floor(step / 2) % SMALL_FACE_SCAN_ROIS.length];
+          return { x: win.x, y: win.y, w: win.w, h: win.h, isSmallCrop: true };
+        }
+      }
+      return { x: 0, y: 0, w: 1, h: 1, isSmallCrop: false };
+    }
+
+    maybeDispatchInference(nowMs, force = false) {
+      if (!this.enabled || !this.workerReady || (!this.worker && !this.mainTracker) || this.workerBusy || !this.video || !this.gl || this.contextLost) return false;
+      const captureTs = performance.now();
+      const minIntervalMs = this.mainTracker ? 75 : IS_IOS_OR_MOBILE ? 24 : this.degradeTier === "L0" ? 8 : 26;
+      if (!force && captureTs - this.lastInferSentMs < minIntervalMs) return false;
+
       const vw = this.video.videoWidth;
       const vh = this.video.videoHeight;
-      if (!vw || !vh) return;
-      const scale = Math.min(1, maxEdge / Math.max(vw, vh));
-      const tw = Math.max(32, Math.round(vw * scale));
-      const th = Math.max(32, Math.round(vh * scale));
-      if (this.inferCanvas.width !== tw || this.inferCanvas.height !== th) {
-        this.inferCanvas.width = tw;
-        this.inferCanvas.height = th;
-      }
-      this.inferCtx.drawImage(this.video, 0, 0, tw, th);
-      this.lastInferSentMs = nowMs;
+      if (!vw || !vh) return false;
 
-      if (this.mainTracker) {
-        const lm = this.mainTracker.detect(this.inferCanvas, nowMs);
-        this.detectFrameCount++;
-        if (lm) {
-          this.latestLandmarks = lm;
-          this.latestLandmarkTs = performance.now();
-          this.validFaceStreak = Math.min(this.validFaceStreak + 1, 10);
-          if (this.video.paused) {
-            this.validFaceStreak = Math.max(this.validFaceStreak, 2);
-            this.fadeWeight = 1.0;
-          }
-        } else {
-          this.validFaceStreak = 0;
+      let vf = null;
+      if (typeof VideoFrame === "function") {
+        try { vf = new VideoFrame(this.video); } catch (_) { vf = null; }
+      }
+      const frameSrc = vf || this.video;
+
+      let isSceneCut = false;
+      let roi = { x: 0, y: 0, w: 1, h: 1, isSmallCrop: false };
+      let frameId = 0;
+
+      try {
+        isSceneCut = this.detectSceneCut(frameSrc);
+        roi = this.computeInferRoi(vw, vh, isSceneCut);
+
+        const sx = Math.floor(roi.x * vw);
+        const sy = Math.floor(roi.y * vh);
+        const sw = Math.max(16, Math.min(vw - sx, Math.round(roi.w * vw)));
+        const sh = Math.max(16, Math.min(vh - sy, Math.round(roi.h * vh)));
+        const exactRoi = { x: sx / vw, y: sy / vh, w: sw / vw, h: sh / vh };
+
+        const baseEdge = this.degradeTier === "L0" ? this.adaptiveInferEdge : IS_IOS_OR_MOBILE ? 320 : 416;
+        const targetEdge = roi.isSmallCrop ? Math.min(384, baseEdge) : baseEdge;
+        const scale = Math.min(1, targetEdge / Math.max(sw, sh));
+        const tw = Math.max(32, Math.round(sw * scale));
+        const th = Math.max(32, Math.round(sh * scale));
+
+        if (this.inferCanvas.width !== tw || this.inferCanvas.height !== th) {
+          this.inferCanvas.width = tw;
+          this.inferCanvas.height = th;
         }
-        return;
+        this.inferCtx.drawImage(frameSrc, sx, sy, sw, sh, 0, 0, tw, th);
+        this.lastInferSentMs = captureTs;
+
+        if (this.mainTracker) {
+          const res = this.mainTracker.detect(this.inferCanvas, exactRoi);
+          this.detectFrameCount++;
+          if (res && res.landmarks) {
+            this.latestLandmarks = res.landmarks;
+            this.latestLandmarkTs = captureTs;
+            this.latestLandmarkRecvTs = performance.now();
+            this.lastFaceBox = res.faceBox || null;
+            this.validFaceStreak = Math.min(this.validFaceStreak + 1, 10);
+            this.missStreak = 0;
+            this.scanStep = 0;
+            this.fadeWeight = 1.0;
+            this.reshapeGate = 1.0;
+          } else {
+            if (exactRoi.w < 0.99 || exactRoi.h < 0.99) this.lastFaceBox = null;
+            if (isSceneCut || !this.latestLandmarks || this.missStreak >= 3) {
+              this.latestLandmarks = null;
+              this.lastFaceBox = null;
+              this.validFaceStreak = 0;
+              this.missStreak = 0;
+              this.fadeWeight = 0.0;
+              this.reshapeGate = 0.0;
+            } else {
+              this.missStreak++;
+              this.fadeWeight = Math.max(0.18, 1.0 - this.missStreak * 0.27);
+              this.reshapeGate = Math.max(0.0, 1.0 - this.missStreak * 0.5);
+            }
+          }
+          return true;
+        }
+
+        // Worker Frame-Paired path: upload atomic frame into pendingTex
+        const gl = this.gl;
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, this.pendingTex);
+        try {
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frameSrc);
+        } catch (_) {
+          this.captureStatus = "cors_restricted";
+          this.stopBeautyOverlay("运行时取帧受限，已恢复原画。");
+          return false;
+        }
+
+        frameId = ++this.frameSeq;
+        this.pendingFrameId = frameId;
+        this.pendingMediaTime = this.video.currentTime;
+        this.pendingSceneCut = isSceneCut;
+        this.workerBusy = true;
+        roi = exactRoi;
+      } finally {
+        if (vf) { try { vf.close(); } catch (_) {} }
       }
 
-      this.workerBusy = true;
       createImageBitmap(this.inferCanvas)
         .then((bitmap) => {
-          if (!this.worker) { bitmap.close(); this.workerBusy = false; return; }
-          this.worker.postMessage({ type: "FRAME", bitmap, timestampMs: nowMs }, [bitmap]);
+          if (!this.worker || frameId !== this.pendingFrameId) {
+            bitmap.close();
+            if (frameId === this.pendingFrameId) this.workerBusy = false;
+            return;
+          }
+          this.worker.postMessage(
+            { type: "FRAME", bitmap, frameId, timestampMs: captureTs, roi, sceneCut: isSceneCut, mode: "paired" },
+            [bitmap]
+          );
         })
         .catch(() => { this.workerBusy = false; });
+      return true;
     }
 
     updateFaceMaskTexture(nowMs) {
       if (!this.workerReady || !this.latestLandmarks) return false;
       const isPaused = !!(this.video && this.video.paused);
-      const ageMs = Math.max(0, nowMs - this.latestLandmarkTs);
-      if (!isPaused && ageMs > 220) {
-        this.fadeWeight = Math.max(0, this.fadeWeight - 0.25);
-        return this.fadeWeight > 0.01;
+      if (this.mainTracker) {
+        const recvAgeMs = Math.max(0, performance.now() - (this.latestLandmarkRecvTs || this.latestLandmarkTs));
+        if (!isPaused && recvAgeMs > 280) {
+          this.fadeWeight = Math.max(0, this.fadeWeight - 0.25);
+          return this.fadeWeight > 0.01;
+        }
       }
-      if (this.validFaceStreak >= 2) this.fadeWeight = Math.min(1.0, this.fadeWeight + 0.2);
-      else this.fadeWeight = Math.max(0.0, this.fadeWeight - 0.2);
 
       const ctx = this.maskCtx;
       const w = this.maskCanvas.width;
       const h = this.maskCanvas.height;
       ctx.clearRect(0, 0, w, h);
 
-      const dtSec = isPaused ? 0 : Math.min(ageMs, 120) / 1000;
       const lm = this.latestLandmarks;
       const ptUv = (idx) => {
         const b = idx * 4;
-        if (b + 3 >= lm.length) return [0.5, 0.5];
-        return [
-          Math.min(1, Math.max(0, lm[b] + lm[b + 2] * dtSec)),
-          Math.min(1, Math.max(0, lm[b + 1] + lm[b + 3] * dtSec)),
-        ];
+        if (b + 1 >= lm.length) return [0.5, 0.5];
+        return [Math.min(1, Math.max(0, lm[b])), Math.min(1, Math.max(0, lm[b + 1]))];
       };
-      const pt = (idx) => { const [x, y] = ptUv(idx); return [x * w, y * h]; };
       const avgUv = (idxs) => {
         let sx = 0, sy = 0;
         for (const i of idxs) { const [x, y] = ptUv(i); sx += x; sy += y; }
@@ -2290,19 +2739,30 @@
       const rEye = avgUv([263, 362, 386, 374]);
       const lEyeOuter = ptUv(33);
       const rEyeOuter = ptUv(263);
-      const lEyeR = Math.max(0.015, distAspect(ptUv(33), ptUv(133)) * 1.15);
-      const rEyeR = Math.max(0.015, distAspect(ptUv(263), ptUv(362)) * 1.15);
+      const lEyeR = Math.max(0.012, distAspect(lEyeOuter, ptUv(133)) * 1.15);
+      const rEyeR = Math.max(0.012, distAspect(rEyeOuter, ptUv(362)) * 1.15);
       const leftEar = ptUv(234), rightEar = ptUv(454), forehead = ptUv(10), chin = ptUv(152);
       const noseBridgeTop = ptUv(168), noseTip = ptUv(1);
       const leftMouth = ptUv(61), rightMouth = ptUv(291);
       const mouthCenter = avgUv([13, 14, 61, 291]);
-      const faceWidth = Math.max(0.04, distAspect(leftEar, rightEar));
-      const faceHeight = Math.max(0.05, distAspect(forehead, chin));
+      const faceWidth = Math.max(0.03, distAspect(leftEar, rightEar));
+      const faceHeight = Math.max(0.04, distAspect(forehead, chin));
+      const mouthHalfW = Math.max(0.008, distAspect(leftMouth, rightMouth) * 0.55);
       const leftCheek = ptUv(132), leftJaw = ptUv(172), rightCheek = ptUv(361), rightJaw = ptUv(397);
       const leftWing = ptUv(129), rightWing = ptUv(358);
+
+      const upRawAx = (noseBridgeTop[0] - noseTip[0]) * aspect;
+      const upRawAy = noseBridgeTop[1] - noseTip[1] - 1e-4;
+      const upLen = Math.hypot(upRawAx, upRawAy) || 1;
+      const upUvX = (upRawAx / upLen) / aspect;
+      const upUvY = upRawAy / upLen;
+
       const dL = distAspect(noseTip, leftEar), dR = distAspect(noseTip, rightEar);
+      const denomLR = Math.max(dL + dR, 1e-4);
+      const leftVis = Math.max(0, Math.min(1, (dL / denomLR - 0.16) / 0.22));
+      const rightVis = Math.max(0, Math.min(1, (dR / denomLR - 0.16) / 0.22));
       const sym = Math.min(dL, dR) / Math.max(dL, dR, 1e-4);
-      const yawFactor = Math.max(0, Math.min(1, (sym - 0.25) / 0.35));
+      const yawFactor = Math.max(0, Math.min(1, (sym - 0.18) / 0.34));
 
       this.faceAnchors = {
         eyes: [lEye[0], lEye[1], rEye[0], rEye[1]],
@@ -2315,27 +2775,60 @@
         rightContour: [rightCheek[0], rightCheek[1], rightJaw[0], rightJaw[1]],
         noseWings: [leftWing[0], leftWing[1], rightWing[0], rightWing[1]],
         yawFactor,
+        leftVis,
+        rightVis,
+        mouthHalfW,
       };
 
-      const trace = (indices) => {
+      const ovalUv = new Array(FACE_OVAL_IDX.length);
+      let minX = 1, minY = 1, maxX = 0, maxY = 0;
+      for (let i = 0; i < FACE_OVAL_IDX.length; i++) {
+        const idx = FACE_OVAL_IDX[i];
+        let [x, y] = ptUv(idx);
+        const ext = FOREHEAD_EXTEND[idx];
+        if (ext) { x += upUvX * (faceHeight * ext); y += upUvY * (faceHeight * ext); }
+        ovalUv[i] = [x, y];
+        if (x < minX) minX = x; if (y < minY) minY = y;
+        if (x > maxX) maxX = x; if (y > maxY) maxY = y;
+      }
+
+      const cx = (minX + maxX) * 0.5, cy = (minY + maxY) * 0.5;
+      const halfA = Math.max((maxX - minX) * aspect, maxY - minY, 0.04) * 0.5 * 1.32;
+      const rw = Math.max(0.04, (halfA * 2) / aspect);
+      const rh = Math.max(0.04, halfA * 2);
+      const rx = cx - rw * 0.5, ry = cy - rh * 0.5;
+      const invRw = 1.0 / rw, invRh = 1.0 / rh;
+      this.maskRect = [rx, ry, invRw, invRh];
+
+      const uvToMask = (x, y) => [(x - rx) * invRw * w, (y - ry) * invRh * h];
+      const traceUvPts = (pts) => {
         ctx.beginPath();
-        indices.forEach((idx, i) => {
-          const [x, y] = pt(idx);
-          if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-        });
+        for (let i = 0; i < pts.length; i++) {
+          const [mx, my] = uvToMask(pts[i][0], pts[i][1]);
+          if (i === 0) ctx.moveTo(mx, my); else ctx.lineTo(mx, my);
+        }
         ctx.closePath();
       };
+      const addSubpathIdx = (indices) => {
+        for (let i = 0; i < indices.length; i++) {
+          const [x, y] = ptUv(indices[i]);
+          const [mx, my] = uvToMask(x, y);
+          if (i === 0) ctx.moveTo(mx, my); else ctx.lineTo(mx, my);
+        }
+        ctx.closePath();
+      };
+      const traceIdx = (indices) => { ctx.beginPath(); addSubpathIdx(indices); };
 
       ctx.save();
-      ctx.filter = "blur(6px)";
+      ctx.filter = "blur(4.2px)";
       ctx.fillStyle = "#ff0000";
-      trace(FACE_OVAL_IDX);
+      traceUvPts(ovalUv);
       ctx.fill();
 
       ctx.globalCompositeOperation = "destination-out";
-      ctx.filter = "blur(3px)";
+      ctx.filter = "blur(1.5px)";
       ctx.fillStyle = "#000000";
-      [LEFT_EYE_IDX, RIGHT_EYE_IDX, LEFT_BROW_IDX, RIGHT_BROW_IDX, LIPS_IDX].forEach((p) => { trace(p); ctx.fill(); });
+      [LEFT_EYE_IDX, RIGHT_EYE_IDX, LEFT_BROW_IDX, RIGHT_BROW_IDX, LIPS_OUTER_IDX].forEach((p) => { traceIdx(p); ctx.fill(); });
 
       ctx.globalCompositeOperation = "destination-over";
       ctx.filter = "none";
@@ -2343,12 +2836,14 @@
       ctx.fillRect(0, 0, w, h);
 
       ctx.globalCompositeOperation = "lighter";
-      ctx.filter = "blur(1px)";
+      ctx.filter = "blur(0.9px)";
       ctx.fillStyle = "#00ff00";
-      [LEFT_EYE_IDX, RIGHT_EYE_IDX].forEach((p) => { trace(p); ctx.fill(); });
+      [LEFT_EYE_IDX, RIGHT_EYE_IDX].forEach((p) => { traceIdx(p); ctx.fill(); });
       ctx.fillStyle = "#0000ff";
-      trace(LIPS_IDX);
-      ctx.fill();
+      ctx.beginPath();
+      addSubpathIdx(LIPS_OUTER_IDX);
+      addSubpathIdx(LIPS_INNER_IDX);
+      ctx.fill("evenodd");
       ctx.restore();
 
       const gl = this.gl;
@@ -2358,36 +2853,22 @@
       return true;
     }
 
-    renderSingleFrame(nowMs = performance.now(), opts = {}) {
-      if ((!this.enabled && !this.theaterActive) || !this.video || !this.gl || this.contextLost || this.captureStatus !== "ready") return;
+    drawCommittedVideoTex(hasFaceMask, nowMs = performance.now()) {
+      if ((!this.enabled && !this.theaterActive) || !this.video || !this.gl || this.contextLost || !this.videoTex) return;
       if (!this.theaterActive) {
         const doc = this.video.ownerDocument || document;
         const fsEl = doc.fullscreenElement || doc.webkitFullscreenElement || document.fullscreenElement;
         if (fsEl === this.video || this.iosNativeFullscreen) return;
       }
 
-      const mt = this.video.currentTime;
-      if (this.lastMediaTime >= 0 && Math.abs(mt - this.lastMediaTime) > 0.6) this.resetTrackingAndFade();
-      this.lastMediaTime = mt;
-
       const t0 = performance.now();
       const gl = this.gl;
-      if (!opts.skipInfer && this.enabled) this.maybeDispatchInference(nowMs, false);
-      const hasFaceMask = this.enabled ? this.updateFaceMaskTexture(nowMs) : false;
-      if (!this.workerReady) this.fadeWeight = 1.0;
+      if (!this.workerReady) { this.fadeWeight = 1.0; this.reshapeGate = 1.0; }
 
       gl.viewport(0, 0, this.canvas.width, this.canvas.height);
       gl.useProgram(this.program);
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, this.videoTex);
-      try {
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this.video);
-      } catch (_) {
-        this.captureStatus = "cors_restricted";
-        this.stopBeautyOverlay("运行时取帧受限，已恢复原画。");
-        return;
-      }
-      this.lastCapturedMediaTime = mt;
 
       const p = this.params;
       const aspect =
@@ -2400,10 +2881,11 @@
       const shadeIdx = Math.max(0, Math.min(LIP_SHADE_RGB.length - 1, Math.round(p.lipShade ?? 2)));
       const lipRgb = LIP_SHADE_RGB[shadeIdx];
       const uvt = this.uvTransform || [1, 1, 0, 0];
+      const mr = this.maskRect || [0, 0, 1, 1];
       const showRaw = this.compareOriginal || !this.enabled;
 
       gl.uniform4f(this.uniforms.u_uvTransform, uvt[0], uvt[1], uvt[2], uvt[3]);
-      gl.uniform2f(this.uniforms.u_texel, 1 / Math.max(this.canvas.width, 1), 1 / Math.max(this.canvas.height, 1));
+      gl.uniform2f(this.uniforms.u_texel, uvt[0] / Math.max(this.canvas.width, 1), uvt[1] / Math.max(this.canvas.height, 1));
       gl.uniform1f(this.uniforms.u_hasFaceMask, hasFaceMask ? 1 : 0);
       gl.uniform1f(this.uniforms.u_compareOriginal, showRaw ? 1 : 0);
 
@@ -2415,6 +2897,14 @@
       gl.uniform4f(this.uniforms.u_lipColor, lipRgb[0], lipRgb[1], lipRgb[2], aspect);
       gl.uniform4f(this.uniforms.u_colorA, p.sharpen, p.exposure, p.contrast, p.saturation);
       gl.uniform4f(this.uniforms.u_colorB, p.temperature, p.softGlow, this.fadeWeight, this.degradeTier === "L2" ? 1 : 0);
+      gl.uniform4f(this.uniforms.u_maskRect, mr[0], mr[1], mr[2], mr[3]);
+      gl.uniform4f(
+        this.uniforms.u_yawVis,
+        hasFaceMask && a ? a.leftVis : 1.0,
+        hasFaceMask && a ? a.rightVis : 1.0,
+        this.reshapeGate,
+        hasFaceMask && a ? a.mouthHalfW : 0.05
+      );
 
       if (hasFaceMask && a) {
         gl.uniform4f(this.uniforms.u_eyes, a.eyes[0], a.eyes[1], a.eyes[2], a.eyes[3]);
@@ -2431,6 +2921,51 @@
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
       this.renderMode = !this.enabled ? "off" : hasFaceMask ? "face_mask" : "skin_fallback";
       this.recordPerformance(performance.now() - t0, nowMs);
+    }
+
+    renderSingleFrame(nowMs = performance.now(), opts = {}) {
+      if ((!this.enabled && !this.theaterActive) || !this.video || !this.gl || this.contextLost || this.captureStatus !== "ready") return;
+      if (!this.theaterActive) {
+        const doc = this.video.ownerDocument || document;
+        const fsEl = doc.fullscreenElement || doc.webkitFullscreenElement || document.fullscreenElement;
+        if (fsEl === this.video || this.iosNativeFullscreen) return;
+      }
+
+      this.maybeSyncGeometryThrottled(nowMs);
+
+      const mt = this.video.currentTime;
+      if (this.lastMediaTime >= 0 && Math.abs(mt - this.lastMediaTime) > 0.6) this.resetTrackingAndFade();
+      this.lastMediaTime = mt;
+
+      // Exact Frame-Paired Live Mode when Worker is active
+      if (this.enabled && this.workerReady && this.worker && !this.mainTracker && !this.video.paused && !opts.skipInfer) {
+        const dispatched = this.maybeDispatchInference(nowMs, false);
+        if (!dispatched && this.workerBusy) this.hasNewVideoFrame = true;
+        const workerStalled = this.workerBusy && performance.now() - this.lastInferSentMs > 240;
+        if (this.hasCommittedFrame && !workerStalled) return;
+      }
+
+      const gl = this.gl;
+      const stallBypass = this.enabled && this.workerReady && this.worker && !this.mainTracker && this.workerBusy && performance.now() - this.lastInferSentMs > 240;
+      if (!this.hasCommittedFrame || !this.workerReady || this.mainTracker || !this.enabled || opts.forceUpload || stallBypass) {
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, this.videoTex);
+        try {
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this.video);
+          this.hasCommittedFrame = true;
+          this.lastCapturedMediaTime = mt;
+        } catch (_) {
+          this.captureStatus = "cors_restricted";
+          this.stopBeautyOverlay("运行时取帧受限，已恢复原画。");
+          return;
+        }
+      }
+
+      if (!opts.skipInfer && this.enabled && this.workerReady) {
+        this.maybeDispatchInference(nowMs, false);
+      }
+      const hasFaceMask = !this.enabled || stallBypass ? false : this.updateFaceMaskTexture(nowMs);
+      this.drawCommittedVideoTex(hasFaceMask, nowMs);
     }
 
     getDroppedFrames(v) {
