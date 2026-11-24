@@ -128,6 +128,9 @@
     precision mediump float;
     uniform sampler2D u_video;
     uniform sampler2D u_mask;
+    uniform sampler2D u_hair;   // 头发置信度（MediaPipe hair_segmenter，覆盖当前推理 ROI）
+    uniform vec4 u_hairRect;    // (x, y, invW, invH)：该遮罩对应的 ROI
+    uniform vec2 u_hairCtrl;    // x = 是否可用(0/1)，y = 剔除强度
     uniform vec2 u_texel;
     uniform float u_hasFaceMask;
     uniform float u_compareOriginal;
@@ -397,6 +400,15 @@
       float skinGate = mix(0.22 * hairProtect, 1.0, clamp(skinW * 1.15, 0.0, 1.0));
       float skinArea = (u_hasFaceMask > 0.5) ? (faceSkinMask * skinGate) : (skinW * 0.85);
 
+      // 头发分割剔除：刘海、碎发盖住的地方**不是皮肤**，只是被肤色阈值误当成额头。
+      // 不剔除的话，发丝缝隙会被美白+磨皮糊平，整张脸看起来像刷了一层白漆。
+      vec2 hairUv = (v_uv - u_hairRect.xy) * u_hairRect.zw;
+      float hairInside =
+        step(0.0, hairUv.x) * step(hairUv.x, 1.0) * step(0.0, hairUv.y) * step(hairUv.y, 1.0);
+      float hairConf =
+        texture2D(u_hair, clamp(hairUv, 0.0, 1.0)).r * hairInside * u_hairCtrl.x;
+      skinArea *= 1.0 - clamp(hairConf * u_hairCtrl.y, 0.0, 1.0);
+
       // Localized under-eye & nasolabial masks (roll-aware & gated by faceSkinMask so eyes/lips stay crisp)
       float ueW = 0.0;
       float nlW = 0.0;
@@ -665,6 +677,11 @@
       this.maskCanvas.height = 256;
       this.maskCtx = this.maskCanvas.getContext("2d");
       this.maskRect = [0, 0, 1, 1]; // [rx, ry, invRw, invRh]
+      // 头发分割遮罩（刘海/碎发剔除），由 Worker 每 2 帧发一次
+      this.hairTex = null;
+      this.hairReady = false;
+      this.hairRect = [0, 0, 1, 1];
+      this.hairAmt = 0.92;
 
       // Downscale/crop canvas for Worker inference
       this.inferCanvas = document.createElement("canvas");
@@ -687,6 +704,27 @@
       this.workerInitializing = false;
       this.workerUnavailable = false;
       this.lastInferSentMs = 0;
+
+      // 头发分割独立 worker（MediaPipe 一个 worker 只能 boot 一个 ModuleFactory）
+      this.hairWorker = null;
+      this.hairBlobUrl = null;
+      this.hairWorkerReady = false;
+      this.hairWorkerBusy = false;
+      this.hairWorkerInitializing = false;
+      this.hairWorkerUnavailable = false;
+      this.hairDelegatePref = "GPU";
+      this.hairWorkerStatus = "未启用";
+      this.hairWatchdog = 0;
+      this.hairSeq = 0;
+      this.hairTick = 0;
+      this.lastHairSentMs = 0;
+      this.hairSegMs = 0;
+      this.hairCoverage = 0;
+      this.facePxInfer = 0;
+      this.hairError = "";
+      // 每 N 次人脸推理才跑一次头发分割：头发不会逐帧剧变，省下的算力留给磨皮
+      this.HAIR_EVERY = 2;
+
       this.latestLandmarks = null; // Float32Array (x, y, vx, vy)
       this.latestLandmarkTs = 0;
       this.latestLandmarkRecvTs = 0;
@@ -1277,6 +1315,13 @@
       this.videoTex = this.createLinearTexture(gl);
       this.pendingTex = this.createLinearTexture(gl);
       this.maskTex = this.createLinearTexture(gl);
+      this.hairTex = this.createLinearTexture(gl);
+      // 1x1 黑占位：模型还没就绪时采样到 0（等于不剔除），避免采样到不完整纹理
+      gl.bindTexture(gl.TEXTURE_2D, this.hairTex);
+      gl.texImage2D(
+        gl.TEXTURE_2D, 0, gl.LUMINANCE, 1, 1, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE,
+        new Uint8Array([0])
+      );
       this.hasCommittedFrame = false;
       this.pendingFrameId = 0;
 
@@ -1298,6 +1343,9 @@
         u_colorA: u("u_colorA"),
         u_colorB: u("u_colorB"),
         u_maskRect: u("u_maskRect"),
+        u_hair: u("u_hair"),
+        u_hairRect: u("u_hairRect"),
+        u_hairCtrl: u("u_hairCtrl"),
         u_yawVis: u("u_yawVis"),
         u_eyes: u("u_eyes"),
         u_eyeOuter: u("u_eyeOuter"),
@@ -1311,6 +1359,9 @@
       };
       gl.uniform1i(this.uniforms.u_video, 0);
       gl.uniform1i(this.uniforms.u_mask, 1);
+      gl.uniform1i(this.uniforms.u_hair, 2);
+      gl.uniform4f(this.uniforms.u_hairRect, 0, 0, 1, 1);
+      gl.uniform2f(this.uniforms.u_hairCtrl, 0, this.hairAmt);
       gl.uniform4f(this.uniforms.u_maskRect, 0, 0, 1, 1);
       gl.uniform4f(this.uniforms.u_yawVis, 1, 1, 1, 0.05);
       return true;
@@ -1647,6 +1698,8 @@
           if (msg.type === "READY") {
             this.workerReady = true;
             this.workerStatus = `就绪 (${msg.delegate} · 零滞后帧同步)`;
+            // 人脸就绪后再起头发分割：它只是增强项，不能抢在美颜主链路前面
+            this.ensureHairWorker();
             if (this.enabled && this.captureStatus === "ready" && this.video) {
               this.maybeDispatchInference(performance.now(), true);
             }
@@ -1663,6 +1716,8 @@
               ? `不可用（使用肤色回退）: ${String(msg.reason).slice(0, 60)}`
               : "未放置本地模型（使用肤色回退）";
             this.terminateWorker(true);
+          } else if (msg.type === "HAIR") {
+            this.updateHairMask(msg);
           } else if (msg.type === "RESULT") {
             this.workerBusy = false;
             this.detectFrameCount++;
@@ -1773,6 +1828,154 @@
       }
     }
 
+    /**
+     * 头发分割独立 worker。
+     * 与人脸 worker 完全解耦：起不来/挂了都不影响美颜，只是刘海保护退化。
+     */
+    async ensureHairWorker(preferredDelegate = this.hairDelegatePref || "GPU") {
+      if (
+        this.hairWorker ||
+        this.hairWorkerInitializing ||
+        this.hairWorkerUnavailable ||
+        !this.enabled ||
+        this.destroyed
+      ) {
+        return;
+      }
+      this.hairWorkerInitializing = true;
+      this.hairDelegatePref = preferredDelegate;
+      this.hairWorkerStatus = preferredDelegate === "CPU" ? "初始化中 (CPU 回退)" : "初始化中";
+      try {
+        const workerUrl = chrome.runtime.getURL("worker/hair-worker.js");
+        const vendorBaseUrl = chrome.runtime.getURL("vendor/mediapipe/");
+        const resp = await fetch(workerUrl);
+        const code = await resp.text();
+        if (!this.enabled || this.destroyed || this.hairWorker) {
+          this.hairWorkerInitializing = false;
+          return;
+        }
+        const blob = new Blob([code], { type: "application/javascript" });
+        this.hairBlobUrl = URL.createObjectURL(blob);
+        const w = new Worker(this.hairBlobUrl, { type: "module" });
+        this.hairWorker = w;
+        this.hairWorkerInitializing = false;
+
+        w.onmessage = (e) => {
+          const msg = e.data;
+          if (!msg || this.hairWorker !== w) return;
+          if (msg.type === "READY") {
+            this.hairWorkerReady = true;
+            this.hairWorkerStatus = `就绪 (${msg.delegate})`;
+            this.hairError = "";
+          } else if (msg.type === "FALLBACK_CPU") {
+            this.terminateHairWorker(true, true);
+            if (this.enabled && !this.destroyed) this.ensureHairWorker("CPU");
+          } else if (msg.type === "UNAVAILABLE") {
+            this.hairWorkerReady = false;
+            this.hairWorkerUnavailable = true;
+            this.hairWorkerStatus = `不可用: ${String(msg.reason || "").slice(0, 60)}`;
+            this.hairError = String(msg.reason || "");
+            this.terminateHairWorker(true, true);
+          } else if (msg.type === "HAIR") {
+            this.hairSegMs = Math.round(this.hairSegMs * 0.7 + (performance.now() - this.lastHairSentMs) * 0.3);
+            this.updateHairMask(msg);
+            this.hairWorkerBusy = false;
+            clearTimeout(this.hairWatchdog);
+          }
+        };
+
+        w.onerror = () => {
+          this.hairWorkerReady = false;
+          this.hairWorkerUnavailable = true;
+          this.hairWorkerStatus = "启动受限";
+          this.terminateHairWorker(true, true);
+        };
+
+        w.postMessage({ type: "INIT", vendorBaseUrl, delegate: preferredDelegate });
+      } catch (_) {
+        this.hairWorkerInitializing = false;
+        this.hairWorkerReady = false;
+        this.hairWorkerUnavailable = true;
+        this.hairWorkerStatus = "启动受限";
+      }
+    }
+
+    /**
+     * 把当前推理帧再缩一份 256x256 发给头发 worker。
+     * 从 inferCanvas 走 createImageBitmap 的 resize 通道，不需要重新解码视频帧。
+     */
+    dispatchHairFrame(roi) {
+      if (!this.hairWorker || !this.hairWorkerReady || this.hairWorkerBusy) return;
+      const src = this.inferCanvas;
+      if (!src || !src.width || !src.height) return;
+      const seq = ++this.hairSeq;
+      this.hairWorkerBusy = true;
+      this.lastHairSentMs = performance.now();
+      // 看门狗：worker 万一卡死（GPU 上下文丢失、异常未捕获），
+      // 不能让 hairWorkerBusy 永久为 true —— 那等于整个生命周期都不再出遮罩。
+      clearTimeout(this.hairWatchdog);
+      this.hairWatchdog = setTimeout(() => {
+        if (!this.hairWorkerBusy) return;
+        this.hairWorkerBusy = false;
+        this.hairWorkerStatus = `${this.hairDelegatePref} · 响应超时`;
+      }, 6000);
+      createImageBitmap(src, {
+        resizeWidth: 256,
+        resizeHeight: 256,
+        resizeQuality: "low",
+      })
+        .then((bitmap) => {
+          if (!this.hairWorker || seq !== this.hairSeq) {
+            bitmap.close();
+            if (seq === this.hairSeq) this.hairWorkerBusy = false;
+            return;
+          }
+          this.hairWorker.postMessage({ type: "FRAME", bitmap, roi, seq }, [bitmap]);
+        })
+        .catch(() => {
+          this.hairWorkerBusy = false;
+        });
+    }
+
+    terminateHairWorker(preserveStatus = false, immediate = false) {
+      this.hairWorkerInitializing = false;
+      const oldWorker = this.hairWorker;
+      const oldBlobUrl = this.hairBlobUrl;
+      this.hairWorker = null;
+      this.hairBlobUrl = null;
+      this.hairWorkerReady = false;
+      this.hairWorkerBusy = false;
+      // worker 没了，之前那张遮罩全部作废，否则会一直按旧位置剔刘海
+      this.hairReady = false;
+      if (!preserveStatus) this.hairWorkerStatus = "未启用";
+      if (!oldWorker) {
+        if (oldBlobUrl) {
+          try {
+            URL.revokeObjectURL(oldBlobUrl);
+          } catch (_) {}
+        }
+        return;
+      }
+      const finalize = () => {
+        try {
+          oldWorker.terminate();
+        } catch (_) {}
+        if (oldBlobUrl) {
+          try {
+            URL.revokeObjectURL(oldBlobUrl);
+          } catch (_) {}
+        }
+      };
+      if (immediate) {
+        finalize();
+        return;
+      }
+      try {
+        oldWorker.postMessage({ type: "CLOSE" });
+      } catch (_) {}
+      setTimeout(finalize, 60);
+    }
+
     terminateWorker(preserveStatus = false, immediate = false) {
       this.workerInitializing = false;
       const oldWorker = this.worker;
@@ -1781,6 +1984,9 @@
       this.workerBlobUrl = null;
       this.workerReady = false;
       this.workerBusy = false;
+      // 人脸 worker 一换，推理帧的节奏/ROI 基准都变了，头发遮罩必须一起作废重建
+      this.hairReady = false;
+      this.terminateHairWorker(false, true);
       if (!preserveStatus) {
         this.workerStatus = "未启用";
       }
@@ -1856,12 +2062,15 @@
 
       const aspect = vw / Math.max(1, vh);
       const box = this.lastFaceBox;
-      // Dynamic High-Res Small-Face ROI Lock:
-      // When locked face is distant/small (<26% width or <36% height), crop a generous ~3.0x square window
-      // straight from native HD video so MediaPipe sees a crisp close-up face at 384x384 (~9.5ms)!
-      if (box && (box.w < 0.26 || box.h < 0.36)) {
+      // Dynamic High-Res Face ROI Lock:
+      // 门槛从 26%/36% 放宽到 45%/55%：半身/近景（脸占 30%–45%）此前全走全帧，
+      // 1920→352 的缩放让脸只剩 ~107px，landmark 模型拿到的基本是插值像素。
+      // 放宽后这段也能进裁切分支；脸太大时 cropA 会被 clamp 到 0.95，
+      // 下面的 rw/rh < 0.88 判断会自动退回全帧，不会强行放大。
+      // 倍率 3.1 → 2.8：窗口更紧，同一边长下脸占的像素更多，且仍留足运动余量。
+      if (box && (box.w < 0.45 || box.h < 0.55)) {
         const faceSizeA = Math.max(box.w * aspect, box.h, 0.08);
-        const cropA = Math.max(0.32, Math.min(0.95, faceSizeA * 3.1));
+        const cropA = Math.max(0.32, Math.min(0.95, faceSizeA * 2.8));
         const rw = Math.min(1.0, cropA / aspect);
         const rh = Math.min(1.0, cropA);
         if (rw < 0.88 || rh < 0.88) {
@@ -1937,7 +2146,14 @@
             : this.degradeTier === "L1"
               ? 416
               : 320;
-        const targetEdge = roi.isSmallCrop ? Math.min(384, baseEdge) : baseEdge;
+        // 关键：裁切时不能把边长压回 384。
+        // 窗口已经比全帧小了，再压边长等于把省下的像素又还回去，
+        // 脸的净分辨率原地踏步（这正是之前“裁了但没更准”的原因）。
+        // 给 448 的下限：自适应会把 baseEdge 压到 352 保帧率，
+        // 但裁切窗口本身很小，448 在这上面的开销远低于全帧，没必要跟着降。
+        const targetEdge = roi.isSmallCrop
+          ? Math.max(448, Math.min(512, baseEdge))
+          : baseEdge;
         const scale = Math.min(1, targetEdge / Math.max(sw, sh));
         const tw = Math.max(32, Math.round(sw * scale));
         const th = Math.max(32, Math.round(sh * scale));
@@ -1947,6 +2163,16 @@
           this.inferCanvas.height = th;
         }
         this.inferCtx.drawImage(frameSrc, sx, sy, sw, sh, 0, 0, tw, th);
+
+        // 诊断：脸在送进模型的图里有多少像素。
+        // landmark 模型的输入是 256，这个值越接近 200+ 越吃得满原始细节；
+        // 低于 ~100 说明脸在推理图里太小，放大只是插值，精度上不去。
+        {
+          const fb = this.lastFaceBox;
+          this.facePxInfer = fb
+            ? Math.round(Math.max(fb.w * vw, fb.h * vh) * scale)
+            : 0;
+        }
 
         frameId = ++this.frameSeq;
         this.pendingFrameId = frameId;
@@ -1987,7 +2213,60 @@
         .catch(() => {
           this.workerBusy = false;
         });
+
+      // 头发分割：独立 worker，每 HAIR_EVERY 次人脸推理跑一次。
+      // workerBusy 在同一时刻只放行一帧，此时 inferCanvas 仍是本帧内容，可安全复用。
+      if (this.hairWorkerReady && !this.hairWorkerBusy) {
+        this.hairTick += 1;
+        if (this.hairTick % this.HAIR_EVERY === 0) {
+          this.dispatchHairFrame(roi);
+        }
+      }
       return true;
+    }
+
+    /**
+     * 接收 Worker 的头发置信度遮罩（Uint8，覆盖推理 ROI），上传为纹理。
+     * 只用 LUMINANCE 单通道：256x256 = 64KB，每 2 帧一次，开销可忽略。
+     */
+    updateHairMask(msg) {
+      const gl = this.gl;
+      if (!gl || !this.hairTex || !msg || !msg.mask || !msg.w || !msg.h) return;
+      try {
+        gl.activeTexture(gl.TEXTURE2);
+        gl.bindTexture(gl.TEXTURE_2D, this.hairTex);
+        gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          gl.LUMINANCE,
+          msg.w,
+          msg.h,
+          0,
+          gl.LUMINANCE,
+          gl.UNSIGNED_BYTE,
+          msg.mask
+        );
+        const roi = msg.roi;
+        this.hairRect =
+          roi && roi.w > 0 && roi.h > 0
+            ? [roi.x, roi.y, 1 / roi.w, 1 / roi.h]
+            : [0, 0, 1, 1];
+        this.hairReady = true;
+
+        // 诊断：mask 只覆盖人脸 ROI，近景人脸里头发通常占 15%–45%。
+        // 恒为 0 说明模型没出结果，恒为 1 说明取错了类别通道。
+        const m = msg.mask;
+        let hits = 0;
+        let n = 0;
+        for (let i = 0; i < m.length; i += 4) {
+          if (m[i] > 128) hits++;
+          n++;
+        }
+        this.hairCoverage = n ? hits / n : 0;
+      } catch (_) {
+        this.hairReady = false;
+      }
     }
 
     updateFaceMaskTexture(nowMs) {
@@ -2252,6 +2531,14 @@
       );
       gl.uniform4f(this.uniforms.u_maskRect, mr[0], mr[1], mr[2], mr[3]);
       gl.uniform4f(
+        this.uniforms.u_hairRect,
+        this.hairRect[0],
+        this.hairRect[1],
+        this.hairRect[2],
+        this.hairRect[3]
+      );
+      gl.uniform2f(this.uniforms.u_hairCtrl, this.hairReady ? 1.0 : 0.0, this.hairAmt);
+      gl.uniform4f(
         this.uniforms.u_yawVis,
         hasFaceMask && a ? a.leftVis : 1.0,
         hasFaceMask && a ? a.rightVis : 1.0,
@@ -2288,6 +2575,10 @@
         );
         gl.uniform4f(this.uniforms.u_noseWings, a.noseWings[0], a.noseWings[1], a.noseWings[2], a.noseWings[3]);
       }
+
+      // 头发遮罩固定占用纹理单元 2；每帧重新绑定一次，避免被其它绘制路径改掉
+      gl.activeTexture(gl.TEXTURE2);
+      gl.bindTexture(gl.TEXTURE_2D, this.hairTex);
 
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
       this.renderMode = hasFaceMask ? "face_mask" : "skin_fallback";
@@ -2450,6 +2741,7 @@
         return;
       }
       this.workerUnavailable = false;
+      this.hairWorkerUnavailable = false;
       if (!this.video) this.scanVideos();
       if (this.video) {
         this.probeAttempts = 0;
@@ -2577,6 +2869,12 @@
           renderP95Ms: this.renderP95Ms,
           inferMs: this.lastInferMs,
           workerStatus: this.workerStatus,
+          hairMask: this.hairReady,
+          hairWorker: this.hairWorkerReady ? `就绪 (${this.hairDelegatePref})` : this.hairWorkerStatus || "未启用",
+          hairError: this.hairError || "",
+          hairSegMs: this.hairSegMs,
+          hairCoverage: Math.round(this.hairCoverage * 1000) / 1000,
+          facePxInfer: this.facePxInfer,
           droppedDelta: this.droppedDelta,
           lastCapturedMediaTime: this.lastCapturedMediaTime,
           overlayInfo,

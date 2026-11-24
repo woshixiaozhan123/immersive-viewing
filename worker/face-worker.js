@@ -14,6 +14,11 @@ let initError = null;
 let activeDelegate = "CPU";
 let lastDetectTs = 0;
 
+// 注意：头发分割**不在这个 worker 里**。
+// MediaPipe 的 ES module WASM 每个 Worker 上下文只允许 boot 一个 ModuleFactory，
+// 在同一 worker 里第二次 createFromOptions 会抛 "ModuleFactory not set"。
+// 因此头发分割由独立的 worker/hair-worker.js 承担。
+
 // Primary face lock state (in full-frame normalized [0,1]x[0,1] space)
 let lockedBox = null;
 let lostSinceTs = 0;

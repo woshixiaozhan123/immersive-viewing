@@ -78,6 +78,7 @@ _STATIC_EXACT = {
     "overlay-ui.js": PROJECT_ROOT / "content" / "overlay-ui.js",
     "player-bar.js": PROJECT_ROOT / "content" / "player-bar.js",
     "worker/face-worker.js": PROJECT_ROOT / "worker" / "face-worker.js",
+    "worker/hair-worker.js": PROJECT_ROOT / "worker" / "hair-worker.js",
     "vendor/hls.min.js": WEB_DIR / "vendor" / "hls.min.js",
     "shim.js": WEB_DIR / "shim.js",
     "app.css": WEB_DIR / "app.css",

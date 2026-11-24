@@ -34,6 +34,12 @@ const ASSETS = [
     dest: path.join(VENDOR, "face_landmarker.task"),
     minBytes: 1_000_000,
   },
+  {
+    // 头发分割（763KB）：用来把刘海/碎发从皮肤遮罩里剔掉，避免"整张脸刷白"
+    url: "https://storage.googleapis.com/mediapipe-models/image_segmenter/hair_segmenter/float32/1/hair_segmenter.tflite",
+    dest: path.join(VENDOR, "hair_segmenter.tflite"),
+    minBytes: 500_000,
+  },
 ];
 
 async function downloadFile(url, dest, minBytes) {

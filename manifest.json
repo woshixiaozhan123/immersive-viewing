@@ -111,7 +111,8 @@
       "resources": [
         "worker/face-worker.js",
         "vendor/mediapipe/*",
-        "vendor/mediapipe/wasm/*"
+        "vendor/mediapipe/wasm/*",
+        "worker/hair-worker.js"
       ],
       "matches": [
         "<all_urls>"
