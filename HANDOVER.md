@@ -197,6 +197,20 @@ overlay-ui.js    chrome.storage.local.get / set
 
 ## 5. 怎么跑
 
+### 5.0 先明确：服务是**可选**的
+
+美颜（`engine.js`）、原站控制条（`player-bar.js`）、B站/YouTube 的 v2 缓存，**全部不依赖本地服务**。
+`cache-server` 只负责「把分片存到硬盘」+「媒体库页面」。
+
+不启动服务时的降级路径（已在代码里确认）：
+
+```
+bridge 探测 GET /api/keys 失败  →  serverOnline = false
+grab-hook.toLocalPlaylist()  →  if (!serverOnline) return mediaUrl   // 原样返回，不改写
+```
+
+结果：原站播放器行为与没装扩展完全一致，美颜与控制条照常工作。**只损失缓存与媒体库。**
+
 ### 5.1 首次准备
 
 ```bash
