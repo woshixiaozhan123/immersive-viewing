@@ -13,12 +13,9 @@ from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
 
 import config
 import webui
-from grab_models import GrabRequest, GrabResponse
-from grab_pipeline import GrabManager
 from hls_proxy import TransparentHlsCache, b64d, safe_key_of
 from maintenance import CacheSweeper
 from models import (
@@ -46,10 +43,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("rb-cache")
 
-# v3 universal grab manager (curl_cffi + TS-first local ffmpeg concat)
-grab_manager = GrabManager()
-
-# v4 transparent HLS cache (segment-level on-demand caching)
+# v4 transparent HLS cache (segment-level on-demand caching) — 唯一的缓存实现
 hls_cache = TransparentHlsCache()
 
 # 定时清理（按「多久没看」+「总量超限」两条规则）
@@ -100,7 +94,6 @@ async def lifespan(_app: FastAPI):
     finally:
         logger.info("Shutting down cache server...")
         sweeper.stop()
-        grab_manager.close()
         hls_cache.close()
         if downloader is not None:
             downloader.close()
@@ -154,7 +147,6 @@ def health() -> dict:
         "ffprobe": config.FFPROBE_PATH,
         "transport": "curl_cffi",
         "pipeline": "transparent-hls-segment-cache",
-        "hlsProxy": config.HLS_PROXY_ENABLED,
         "hlsStats": dict(hls_cache.stats),
     }
 
@@ -183,8 +175,6 @@ def _m3u8_response(body: str) -> Response:
 @app.get("/hls/{safe_key}/master.m3u8")
 def hls_master(safe_key: str, src: str, ref: str = "") -> Response:
     """拉取原始 master，只输出最高码率一档，指向 /v/0.m3u8。"""
-    if not config.HLS_PROXY_ENABLED:
-        raise HTTPException(status_code=503, detail="hls proxy disabled")
     try:
         media_url = b64d(src)
         referer = b64d(ref) if ref else ""
@@ -201,8 +191,6 @@ def hls_master(safe_key: str, src: str, ref: str = "") -> Response:
 @app.get("/hls/{safe_key}/v/{variant}.m3u8")
 def hls_variant(safe_key: str, variant: str, u: str, ref: str = "") -> Response:
     """拉取 media playlist，把分片地址全部改写成 /hls/{key}/seg/{idx}。"""
-    if not config.HLS_PROXY_ENABLED:
-        raise HTTPException(status_code=503, detail="hls proxy disabled")
     try:
         variant_url = b64d(u)
         referer = b64d(ref) if ref else ""
@@ -219,8 +207,6 @@ def hls_variant(safe_key: str, variant: str, u: str, ref: str = "") -> Response:
 @app.get("/hls/{safe_key}/seg/{idx}")
 def hls_segment(safe_key: str, idx: int) -> Response:
     """命中返回本地文件；未命中现场拉取、原子落盘、返回。失败一律 502 让 hls.js 重试。"""
-    if not config.HLS_PROXY_ENABLED:
-        raise HTTPException(status_code=503, detail="hls proxy disabled")
     try:
         data = hls_cache.get_segment(safe_key, idx)
     except Exception as exc:  # noqa: BLE001
@@ -236,121 +222,49 @@ def hls_segment(safe_key: str, idx: int) -> Response:
     return Response(content=data, media_type="video/mp2t", headers=headers)
 
 
-@app.post("/api/grab", response_model=GrabResponse)
-def grab_video(req: GrabRequest) -> GrabResponse:
-    try:
-        res = grab_manager.submit(req)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    return GrabResponse(**res)
-
-
-@app.get("/api/keys")
-def list_complete_keys() -> dict:
-    keys = grab_manager.get_complete_keys()
-    return {
-        "keys": keys,
-        "count": len(keys),
-        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
-    }
-
-
-@app.api_route("/local/{key:path}/out.mp4", methods=["GET", "HEAD"])
-def serve_local_mp4(key: str, request: Request) -> Response:
-    """
-    Serve completed v3 local out.mp4 with automatic HTTP Range / 206 support via FastAPI FileResponse.
-    """
-    is_head = request.method.upper() == "HEAD"
-    range_hdr = request.headers.get("range", "")
-    bump_count = (not is_head) and (not range_hdr or range_hdr.lower().startswith("bytes=0-"))
-
-    try:
-        out_file = grab_manager.resolve_local_mp4(key, bump_play_count=bump_count)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    common_headers = {
-        "Accept-Ranges": "bytes",
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Headers": "Range",
-        "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges",
-        "Access-Control-Allow-Private-Network": "true",
-        "Cache-Control": "no-store",
-    }
-    if out_file is None or not out_file.exists():
-        return Response(content=b"", status_code=404, headers=common_headers)
-
-    return FileResponse(
-        path=out_file,
-        media_type="video/mp4",
-        headers=common_headers,
-    )
-
-
-@app.post("/api/video/{key:path}/unmark")
-def unmark_video(key: str) -> dict:
-    """Mark a corrupted local video as failed so client falls back to origin on next load (spec 6.3)."""
-    try:
-        return grab_manager.unmark_broken(key)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
 @app.get("/api/video/{key:path}")
 def get_video(key: str) -> dict:
+    """v2 走 storage；其余一律走 v4 透明缓存的分片 meta。"""
+    if _is_v2_key(key):
+        return storage.get_video_status(key)
     try:
-        if _is_v2_key(key):
-            return storage.get_video_status(key)
-        v3 = grab_manager.get_video(key)
-        # v4 透明缓存的 meta 用同一目录，按 mode 区分，避免返回 v3 格式
-        if v3.get("exists") and v3.get("mode") != "transparent-hls":
-            return v3
-        try:
-            sk = safe_key_of(key)
-        except Exception:  # noqa: BLE001
-            sk = key
-        v4 = hls_cache.get_video(sk)
-        return v4 if v4.get("exists") else v3
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        sk = safe_key_of(key)
+    except Exception:  # noqa: BLE001
+        sk = key
+    return hls_cache.get_video(sk)
 
 
 @app.get("/api/videos")
 def list_videos(
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
-    scope: str = Query("v3"),
 ) -> dict:
-    if scope == "v2":
-        return storage.list_videos(limit=limit, offset=offset)
-    return grab_manager.list_videos(limit=limit, offset=offset)
+    """只剩 v2 列表；v4 的统一入口是 /api/library（webui.py）。"""
+    return storage.list_videos(limit=limit, offset=offset)
 
 
 @app.delete("/api/video/{key:path}")
 def delete_video(key: str) -> dict:
-    try:
-        if _is_v2_key(key):
-            deleted = storage.delete_video(key)
-        else:
-            deleted = grab_manager.delete_video(key)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    if _is_v2_key(key):
+        deleted = storage.delete_video(key)
+    else:
+        try:
+            sk = safe_key_of(key)
+        except Exception:  # noqa: BLE001
+            sk = key
+        deleted = hls_cache.delete_video(sk)
     return {"deleted": deleted, "key": key}
 
 
 @app.get("/api/stats")
-def get_stats(scope: str = Query("v3")) -> dict:
+def get_stats(scope: str = Query("v4")) -> dict:
     if scope == "v2":
         st = storage.get_stats()
         st["downloader"] = downloader.stats() if downloader else None
         with _serve_stats_lock:
             st["serve"] = dict(SERVE_STATS)
         return st
-    if scope == "v4":
-        return {"hls": dict(hls_cache.stats), "cacheDir": str(config.GRAB_CACHE_DIR)}
-    st = grab_manager.get_stats()
-    st["hls"] = dict(hls_cache.stats)
-    return st
+    return {"hls": dict(hls_cache.stats), "cacheDir": str(config.GRAB_CACHE_DIR)}
 
 
 # ===========================================================================
@@ -473,7 +387,7 @@ def log_cdn_observation(req: UnmatchedSampleRequest) -> dict:
 @app.get("/api/debug/recent")
 def get_recent() -> dict:
     return {
-        "v3": grab_manager.get_stats(),
+        "v4": dict(hls_cache.stats),
         "v2EnqueuedCount": len(RECENT_ENQUEUED),
         "v2CdnObservedCount": len(RECENT_CDN_OBSERVED),
         "v2Downloader": downloader.stats() if downloader else None,

@@ -37,7 +37,7 @@
 
 ```
 ✅ 美颜引擎         26 项效果、7 档预设、中文配方解析、XGPlayer/Plyr/B站/YouTube 适配（全站）
-✅ 本地缓存服务     FastAPI，curl_cffi 传输，ffmpeg 合并
+✅ 本地缓存服务     FastAPI，curl_cffi 传输，ffmpeg 抽帧缩略图（v3 整片下载已删）
 ✅ v4 透明缓存      三家站点实测跑通（边看边存，零额外流量）
 ✅ 缓存按站开关     默认全关，用户在面板里自行开启某站，按域名记忆，可中途热切
 ✅ 缓存自动清理     保留 N 天 + 总容量上限，后台巡检，媒体库可手动立刻清
@@ -55,13 +55,23 @@
 
 ## 3. 架构
 
-### 3.1 三层缓存并存
+### 3.1 两套缓存并存
 
 | 层 | 覆盖 | 代码 | 状态 |
 |---|---|---|---|
 | **v2** | B站 / YouTube（MSE 流） | `content/cache-hook.js` + `storage.py` + `downloader.py` | 原有，保留 |
-| **v3** | 任意站整片下载 | `grab_pipeline.py` + `content/grab-hook.js`(旧) | 保留为「离线保存」底座 |
-| **v4** | MissAV / Javrate / Avbebe 透明缓存 | `hls_proxy.py` + `content/grab-hook.js`(当前) | 稳定 |
+| **v4** | 任意站透明缓存（按域名开关，默认关） | `hls_proxy.py` + `content/grab-hook.js` | 稳定，唯一实现 |
+
+> **v3 整片下载已于 2026-11-24 整体移除。**
+> 它当年被 `video-cache-spec-v4.md` 取代（用户要的是「边看边存」而不是「整片下载」），
+> 但一直留着代码——入口在改 v4 时被拆掉，主体成了 56 KB 死代码，且让
+> `RB_HLS_PROXY=false`（号称「回到 v3」）变成一个假的回退开关。
+> 本次删除：`grab_pipeline.py`、`grab_models.py`、`POST /api/grab`、`GET /api/keys`、
+> `/local/{key}/out.mp4`、`POST /api/video/{key}/unmark`、前端的 `found` / `rb-grab` /
+> `local-broken` 三条上报链路，以及不再用到的 `LOCAL_KEYS` 同步。
+> 其中 4 个 HTTP/TS 工具函数（`_atomic_write_json`、`_parse_attr_list`、
+> `_strip_fake_image_header_if_ts`、`_looks_like_html_error`）被 v4 复用，已搬进 `hls_proxy.py`。
+> **`/api/keys` 原本还兼任「服务存活探针」，现在改成 `GET /health`。**
 
 ### 3.2 v4 数据流（网页播放）
 
@@ -233,9 +243,8 @@ API：`window.RBPlayerBar.setEnabled(bool)` / `isEnabled()` / `refresh()` / `rea
 | `cache-server/webui.py` | ~470 | **新增**。媒体库 + 播放器 + 本地 playlist + 静态资源 + 缩略图 |
 | `cache-server/maintenance.py` | ~250 | **新增**。后台巡检：按天数和容量两条规则清理缓存 |
 | `cache-server/hls_proxy.py` | ~570 | **v4 核心**。透明缓存全部逻辑 |
-| `cache-server/server.py` | ~470 | FastAPI 路由（v2 + v3 + v4 + webui + maintenance 全挂在这） |
+| `cache-server/server.py` | ~400 | FastAPI 路由（v2 + v4 + webui + maintenance） |
 | `cache-server/config.py` | ~85 | 所有配置项 |
-| `cache-server/grab_pipeline.py` | 1368 | v3 整片下载管道（curl_cffi + ffmpeg） |
 | `cache-server/storage.py` | 598 | v2 稀疏文件存储 |
 | `cache-server/downloader.py` | 249 | v2 Range 下载器 |
 
@@ -574,7 +583,7 @@ DELETE /api/library/{key} 删本地缓存
 
 - 服务开机自启（现在手动 `python main.py`）
 - 缓存管理 UI 增强（批量删、按大小排序、搜索）——基础版已有
-- v3 整片下载改成「离线保存」按钮（代码在，缺入口）
+- 「合并为 mp4」按钮：现在缓存是 374 个散 TS 分片，想导出整片需要重新写 ffmpeg 合并（v3 那套已随代码删除）
 - `mode=all` 的分片失败容错
 
 ---
@@ -600,7 +609,6 @@ DELETE /api/library/{key} 删本地缓存
 curl -s http://127.0.0.1:8765/health | python -m json.tool
 curl -s http://127.0.0.1:8765/api/library | python -m json.tool
 curl -s "http://127.0.0.1:8765/api/video/<safeKey>" | python -m json.tool
-curl -s "http://127.0.0.1:8765/api/videos?scope=v3" | python -m json.tool
 ```
 
 ### 9.2 看播放列表
@@ -629,7 +637,7 @@ xxd -l 1 ~/Videos/grab-cache/<safeKey>/segs/000000.ts   # 应是 47
 扩展在页面注入的调试对象：
 
 ```js
-window.__RB_HLS_DEBUG__.getStats()      // {rewritten, v3Hit, skippedOffline}
+window.__RB_HLS_DEBUG__.getStats()      // {rewritten, skippedOffline, skippedNoCache}
 window.__RB_HLS_DEBUG__.getSafeKey()
 window.__RB_HLS_DEBUG__.isServerOnline()
 window.__RB_HLS_DEBUG__.toLocalPlaylist(url)  // 手动测试改写
@@ -702,9 +710,8 @@ JSON.parse(localStorage.getItem('rbp:rbpPlayerBarHosts'))
 RB_CACHE_PORT=8765
 RB_GRAB_CACHE_DIR=~/Videos/grab-cache
 RB_HLS_PREFERRED_HEIGHT=720     # 选档上限，0=最高档
-RB_HLS_PREFETCH=3               # 预取片数，>3 退化成整片下载
+RB_HLS_PREFETCH=3               # 预取片数，>3 会明显吃带宽
 RB_HLS_MAX_FETCH=4              # 全局并发，别超 8
-RB_HLS_PROXY=false              # 关掉透明缓存，回到 v3
 RB_GRAB_IMPERSONATE=chrome      # curl_cffi 指纹
 
 # 自动清理
@@ -754,6 +761,6 @@ rbpPlayerBarHosts { "missav.ws": true } 播放器控制条，无条目=三站默
 
 ## 12. 参考文档
 
-- `video-cache-spec-v3.md` —— v3 整片下载规格（第 0 节的实测数据仍有效）
+- `video-cache-spec-v3.md` —— 已废弃（整片下载被 v4 取代，代码已删）；第 0 节的三家媒体源 / CDN / curl_cffi 实测数据仍有效
 - `video-cache-spec-v4.md` —— v4 透明缓存规格
 - `realtime_beauty_cache_design.md` —— 关键点预扫的原始设计（第 2 节、4.4 节仍有效）

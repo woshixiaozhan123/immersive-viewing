@@ -6,7 +6,7 @@
  *   - 原生 `<video src="*.m3u8">` 也改写（Safari 类）
  *   - 本地服务不可用时**不改写**，播放器行为与未装扩展完全一致
  *
- * 保留 v3 能力：若该 pageKey 已有整片 out.mp4（v3 下载完成），直接把 <video> 指向本地 mp4。
+ * 只管分片级透明缓存。v3 的整片下载（out.mp4）已于 2026-11-24 移除。
  */
 (() => {
   if (window.__RB_GRAB_HOOK__) return;
@@ -23,19 +23,18 @@
   } catch (_) {}
 
   const LOCAL_ORIGIN = "http://127.0.0.1:8765";
-  const SESSION_KEY = "rb_v3_state";
+  const SESSION_KEY = "rb_cache_state";
   const M3U8_RE = /\.m3u8(\?|#|$)/i;
 
   let pageKey = null;
   let pageUrl = window.location.href;
-  let LOCAL_KEYS = new Set();
   let serverOnline = false;
   // 缓存开关（按域名，用户自己开）。false 时完全不改写 m3u8 = 不落盘。
   let cacheEnabled = false;
   // 已经 patch 过的 hls.js 实例，用于「中途开关」时热切换
   const LIVE_PLAYERS = [];
 
-  const STATS = { rewritten: 0, v3Hit: 0, skippedOffline: 0, skippedNoCache: 0 };
+  const STATS = { rewritten: 0, skippedOffline: 0, skippedNoCache: 0 };
 
   // =========================================================================
   // 状态同步（来自 ISOLATED world 的 grab-relay.js）
@@ -44,7 +43,6 @@
     if (!state || typeof state !== "object") return;
     if (typeof state.pageKey === "string" && state.pageKey) pageKey = state.pageKey;
     if (typeof state.pageUrl === "string" && state.pageUrl) pageUrl = state.pageUrl;
-    if (Array.isArray(state.keys)) LOCAL_KEYS = new Set(state.keys);
     if (typeof state.serverOnline === "boolean") serverOnline = state.serverOnline;
     if (typeof state.cacheEnabled === "boolean") {
       const wasOff = !cacheEnabled;
@@ -52,8 +50,6 @@
       // 用户中途打开开关：把正在播的 hls.js 实例热切到本地代理，不用刷新页面
       if (wasOff && cacheEnabled) reapplyLivePlayers();
     }
-    // 状态同步后如果已有主播放器，尝试升级到 v3 整片
-    if (queryV3Local()) upgradeExistingMainVideo();
   }
 
   try {
@@ -222,106 +218,12 @@
           const s = val === null || val === undefined ? "" : String(val);
           if (s && !isLocal(s) && M3U8_RE.test(s)) {
             next = toLocalPlaylist(s);
-          } else if (s && !isLocal(s) && /\.mp4(\?|#|$)/i.test(s) && serverOnline) {
-            // 直接 mp4 直链暂不接管（v3 全量下载路径负责），保持原样
-          }
-        } catch (_) {}
-
-        // v3 整片已完成时，直接把 src 顶到 out.mp4
-        try {
-          const localMp4 = queryV3Local();
-          if (localMp4 && this.tagName === "VIDEO" && isMainPlayer(this)) {
-            const s = String(next || "");
-            if (s && !isLocal(s)) {
-              this.dataset.rbOrig = s;
-              STATS.v3Hit += 1;
-              return videoSrcDesc.set.call(this, localMp4);
-            }
           }
         } catch (_) {}
 
         return videoSrcDesc.set.call(this, next);
       },
     });
-  }
-
-  const origSetAttr = Element.prototype.setAttribute;
-  Element.prototype.setAttribute = function (attrName, attrVal) {
-    if (this.tagName === "VIDEO" && String(attrName || "").toLowerCase() === "src") {
-      try {
-        const localMp4 = queryV3Local();
-        if (localMp4 && isMainPlayer(this)) {
-          const s = attrVal === null || attrVal === undefined ? "" : String(attrVal);
-          if (s && !isLocal(s)) {
-            if (!this.dataset.rbOrig) this.dataset.rbOrig = s;
-            STATS.v3Hit += 1;
-            return origSetAttr.call(this, attrName, localMp4);
-          }
-        }
-      } catch (_) {}
-    }
-    return origSetAttr.apply(this, arguments);
-  };
-
-  // =========================================================================
-  // v3 整片命中
-  // =========================================================================
-  function queryV3Local() {
-    if (!serverOnline || !pageKey) return null;
-    if (!LOCAL_KEYS.has(pageKey)) return null;
-    return `${LOCAL_ORIGIN}/local/${encodeURIComponent(pageKey)}/out.mp4`;
-  }
-
-  function isMainPlayer(el) {
-    if (!el || el.tagName !== "VIDEO") return false;
-    try {
-      if (window !== window.top && (window.innerWidth <= 320 || window.innerHeight <= 180)) {
-        return false;
-      }
-      const r = el.getBoundingClientRect();
-      if (r.width > 320 && r.height > 180) return true;
-      if (r.width > 0 || r.height > 0) {
-        return Boolean(el.controls && r.width > 240 && r.height > 140);
-      }
-      if (el.controls) return true;
-      const parent = el.parentElement;
-      if (parent) {
-        const pr = parent.getBoundingClientRect();
-        if (pr.width > 320 && pr.height > 180) return true;
-        if (pr.width > 0 || pr.height > 0) return false;
-      }
-      return !el.isConnected && window.innerWidth > 320 && window.innerHeight > 180;
-    } catch (_) {
-      return false;
-    }
-  }
-
-  function upgradeExistingMainVideo() {
-    const localMp4 = queryV3Local();
-    if (!localMp4) return;
-    try {
-      document.querySelectorAll("video").forEach((v) => {
-        if (!isMainPlayer(v)) return;
-        const cur = v.currentSrc || v.src || "";
-        if (cur.startsWith(LOCAL_ORIGIN)) return;
-        if (!cur) return;
-        const pos = v.currentTime || 0;
-        const wasPlaying = !v.paused;
-        if (!v.dataset.rbOrig) v.dataset.rbOrig = cur;
-        STATS.v3Hit += 1;
-        videoSrcDesc && videoSrcDesc.set && videoSrcDesc.set.call(v, localMp4);
-        if (pos > 0) {
-          try {
-            v.currentTime = pos;
-          } catch (_) {}
-        }
-        if (wasPlaying) {
-          try {
-            v.play().catch(() => {});
-          } catch (_) {}
-        }
-      });
-    } catch (_) {}
   }
 
   // =========================================================================
@@ -358,7 +260,6 @@
   window.__RB_HLS_DEBUG__ = {
     getPageKey: () => pageKey,
     getSafeKey: () => currentSafeKey(),
-    getKeys: () => Array.from(LOCAL_KEYS),
     isServerOnline: () => serverOnline,
     isCacheEnabled: () => cacheEnabled,
     getStats: () => ({ ...STATS }),

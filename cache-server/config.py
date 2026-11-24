@@ -61,7 +61,6 @@ GRAB_IMPERSONATE: str = os.environ.get("RB_GRAB_IMPERSONATE", "chrome")
 # v4 Transparent HLS cache (video-cache-spec-v4.md)
 # 播放器指向本地 m3u8，分片命中就返回、未命中现拉一份存着。
 # ---------------------------------------------------------------------------
-HLS_PROXY_ENABLED: bool = os.environ.get("RB_HLS_PROXY", "true").lower() == "true"
 # 全局并发：实测 6 并发 ≈ 4.6 MB/s 且不触发限速，这里默认 4 更稳
 HLS_MAX_CONCURRENT_FETCH: int = int(os.environ.get("RB_HLS_MAX_FETCH", "4"))
 # 预取后续分片数：0 关闭，>3 会退化成整片下载

@@ -1,9 +1,11 @@
 /**
- * Realtime Beauty · Universal Video Grab Relay (ISOLATED world, document_start, all_frames, spec v3)
+ * Realtime Beauty · Cache Relay (ISOLATED world, document_start, all_frames, spec v4)
  * Bridges MAIN-world content/grab-hook.js <-> background/grab-bridge.js across top page & nested iframes:
- *  - Fetches authoritative top-level pageKey & completed LOCAL_KEYS from SW on startup
- *  - Syncs updates to sessionStorage("rb_v3_state") and posts them into MAIN world
- *  - Relays detected media sources ("found") and playback fallback errors ("local-broken") to SW
+ *  - Fetches authoritative top-level pageKey + service liveness from SW on startup
+ *  - Reads the per-domain 本站缓存 preference (chrome.storage.local is not reachable from MAIN world)
+ *  - Syncs everything to sessionStorage and posts it into MAIN world
+ *
+ * v3 的 media-source 上报（"found"）与损坏回退（"local-broken"）已于 2026-11-24 移除。
  */
 (() => {
   if (window.__RB_GRAB_RELAY__) return;
@@ -15,13 +17,12 @@
     if (host.endsWith("bilibili.com") || host.endsWith("youtube.com")) return;
   } catch (_) {}
 
-  const SESSION_KEY = "rb_v3_state";
+  const SESSION_KEY = "rb_cache_state";
   // 缓存开关：按域名记忆，{ "missav.ws": true, ... }。没有条目 = 不缓存。
   const CACHE_HOSTS_KEY = "rbCacheHosts";
 
   let lastPageKey = null;
   let lastPageUrl = null;
-  let lastKeys = [];
   let lastOnline = false;
   let lastCacheEnabled = false;
 
@@ -54,16 +55,14 @@
     if (cb) cb();
   }
 
-  function pushStateToMain(pageKey, pageUrl, keys, serverOnline) {
+  function pushStateToMain(pageKey, pageUrl, serverOnline) {
     lastPageKey = pageKey || lastPageKey;
     lastPageUrl = pageUrl || lastPageUrl;
-    if (Array.isArray(keys)) lastKeys = keys;
     if (typeof serverOnline === "boolean") lastOnline = serverOnline;
 
     const state = {
       pageKey: lastPageKey,
       pageUrl: lastPageUrl,
-      keys: lastKeys,
       serverOnline: lastOnline,
       cacheEnabled: lastCacheEnabled,
     };
@@ -85,10 +84,10 @@
         },
         (res) => {
           if (chrome.runtime.lastError || !res) {
-            pushStateToMain(null, null, [], false);
+            pushStateToMain(null, null, false);
             return;
           }
-          pushStateToMain(res.pageKey || null, res.pageUrl || null, res.keys || [], Boolean(res.serverOnline));
+          pushStateToMain(res.pageKey || null, res.pageUrl || null, Boolean(res.serverOnline));
         }
       );
     } catch (_) {}
@@ -101,14 +100,12 @@
         // 面板里切换「本站缓存」后立刻同步给 MAIN，不用刷新页面
         if (area === "local" && changes[CACHE_HOSTS_KEY]) {
           lastCacheEnabled = resolveCacheEnabled(changes[CACHE_HOSTS_KEY].newValue);
-          pushStateToMain(null, null, null, null);
+          pushStateToMain(null, null, null);
           return;
         }
         if (area !== "session") return;
-        const nextKeys = changes.rbKeys ? changes.rbKeys.newValue : lastKeys;
-        const nextOnline = changes.rbServerOnline ? changes.rbServerOnline.newValue : lastOnline;
-        if (changes.rbKeys || changes.rbServerOnline) {
-          pushStateToMain(lastPageKey, lastPageUrl, nextKeys, nextOnline);
+        if (changes.rbServerOnline) {
+          pushStateToMain(lastPageKey, lastPageUrl, changes.rbServerOnline.newValue);
         }
       });
     }
@@ -123,51 +120,6 @@
     if (data.__rbGrab === "request-sync") {
       readCachePref(() => requestInitFromSw());
       return;
-    }
-
-    if (data.__rbGrab === "found") {
-      if (!canUseRuntime()) return;
-      try {
-        chrome.runtime.sendMessage(
-          {
-            type: "rb-grab",
-            payload: {
-              url: data.url,
-              kind: data.kind || "auto",
-              contentType: data.contentType || null,
-              contentLength: data.contentLength || 0,
-              pageUrl: lastPageUrl || data.pageUrl || window.location.href,
-              frameUrl: data.frameUrl || window.location.href,
-              referer: window.location.href,
-              title: document.title || "",
-              userAgent: navigator.userAgent || "",
-            },
-          },
-          () => {
-            void chrome.runtime.lastError;
-          }
-        );
-      } catch (_) {}
-      return;
-    }
-
-    if (data.__rbGrab === "local-broken") {
-      if (!canUseRuntime()) return;
-      try {
-        chrome.runtime.sendMessage(
-          {
-            type: "rb-local-broken",
-            payload: {
-              pageKey: data.pageKey || lastPageKey,
-              pageUrl: lastPageUrl || window.location.href,
-              url: data.url || "",
-            },
-          },
-          () => {
-            void chrome.runtime.lastError;
-          }
-        );
-      } catch (_) {}
     }
   });
 

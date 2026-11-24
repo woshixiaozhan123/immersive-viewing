@@ -3,13 +3,16 @@
 播放器被改指向 `/hls/{key}/master.m3u8`，之后每一片都先问本地：
 命中直接返回；未命中用 curl_cffi 现场拉一份、原子落盘、再返回。
 
-与 v3 的关系：v3 的整片下载（out.mp4）保留，本模块只在没有整片缓存时接管。
+这是唯一的缓存实现。v3 的整片下载（out.mp4）已于 2026-11-24 整体移除，
+下面的 4 个 HTTP/TS 工具函数原先寄生在 grab_pipeline.py 里，一并搬到这里。
 """
 
 from __future__ import annotations
 
 import base64
+import json
 import logging
+import os
 import re
 import threading
 import time
@@ -21,18 +24,60 @@ from urllib.parse import urljoin, urlparse
 from curl_cffi import requests as cffi_requests
 
 import config
-from grab_pipeline import (
-    _atomic_write_json,
-    _looks_like_html_error,
-    _parse_attr_list,
-    _strip_fake_image_header_if_ts,
-)
 
 logger = logging.getLogger("rb-hls")
 
 _SAFE_DIR_RE = re.compile(r"[^\w.\-]")
 _ATTR_RE = re.compile(r'([A-Z0-9-]+)=("([^"]*)"|([^,]*))')
 _M3U8_RE = re.compile(r"\.m3u8(\?|#|$)", re.IGNORECASE)
+
+
+# ---------------------------------------------------------------------------
+# 从 grab_pipeline.py 搬来的工具函数（v3 删除后由本模块自持）
+# ---------------------------------------------------------------------------
+def _atomic_write_json(path: Path, obj: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".{path.name}.{threading.get_ident()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+    for attempt in range(5):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.02 * (attempt + 1))
+
+
+def _parse_attr_list(raw: str) -> dict[str, str]:
+    attrs: dict[str, str] = {}
+    for m in _ATTR_RE.finditer(raw):
+        k = m.group(1).upper()
+        v = m.group(3) if m.group(3) is not None else (m.group(4) or "").strip()
+        attrs[k] = v
+    return attrs
+
+
+def _strip_fake_image_header_if_ts(data: bytes) -> bytes:
+    """
+    Spec 8.1(1): NEVER touch pure MPEG-TS packets (offset 0 == 0x47).
+    Only if offset 0 is NOT 0x47, look for an exact MPEG-TS PAT packet header (0x47 0x40 0x11)
+    aligned on 188-byte packet boundaries; otherwise keep bytes untouched.
+    """
+    if not data or data[0] == 0x47:
+        return data
+    if len(data) >= 8 and data[4:8] in (b"ftyp", b"styp", b"moof", b"moov", b"sidx", b"mdat"):
+        return data
+    idx = data.find(b"\x47\x40\x11", 1, 512)
+    if idx > 0 and (idx + 188 >= len(data) or data[idx + 188] == 0x47):
+        return data[idx:]
+    return data
+
+
+def _looks_like_html_error(data: bytes) -> bool:
+    head = data[:256].lstrip().lower()
+    return head.startswith((b"<!doctype html", b"<html", b"<?xml", b"<head"))
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +93,7 @@ def b64d(token: str) -> str:
 
 
 def safe_key_of(page_url: str) -> str:
-    """与 grab_pipeline.compute_page_key 的 safeKey 保持一致，但从 pageUrl 直接算。"""
+    """由 pageUrl 直接算 safeKey：hostname + path，非字母数字与 . - / 的字符一律换成 _。"""
     raw = (page_url or "").strip()
     if not raw:
         raise ValueError("empty pageUrl")
