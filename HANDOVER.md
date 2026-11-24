@@ -46,7 +46,7 @@
 ✅ 发丝分割         独立 hair-worker.js 跑 MediaPipe hair_segmenter，刘海/碎发不进磨皮
 ✅ 推理分辨率       裁切模式下 448–512 边长（原先被硬压到 384），脸在推理图里 168–252px
 ✅ 本地媒体库       GET / 列出已缓存视频（缩略图/进度/删除/清理规则），离线兜底用
-⬜ 关键点预扫       未开始（原始设计文档的核心目标，见 7.4）
+✅ 关键点预扫       已缓存 TS 离线 4fps 预扫（132 点位定长二进制 + 查表兜底，见 7.4）
 ```
 
 **服务当前状态**：正在 `127.0.0.1:8765` 运行（需手动启动）。
@@ -578,6 +578,28 @@ DELETE /api/library/{key} 删本地缓存
 **预估**：2–3 天。先做「查表 + 回退」，效果就出来一大半，插值后加。
 
 **注意**：预扫用 `mode=all` 会顺带把未缓存分片拉下来（等于边扫边缓存），这是好事；但 Javrate 的 token 过期后会失败，此时降级成 `mode=cached` 只扫已有段（时间轴会被压缩，要重新对齐）。
+
+#### 已完成（2026-11-24 · 按 `HANDOVER-PRESCAN.md` 实施，阶段 1 + 阶段 2）
+
+实际落地改用「**只扫已缓存 TS 分片（绝不回源）+ 服务端 MediaPipe 离线扫描 + 播放器时间轴映射 + `engine.js` 查表兜底**」两阶段方案：
+
+- **阶段 1（服务端）**：
+  - `cache-server/prescan.py`：复用 `webui._scan_segs` / `_snapshot_durations` / `_ranges`，`ffmpeg` 按连续区间 concat 解码，MediaPipe 1.2.3 `FaceLandmarker`（复用 `vendor/mediapipe/face_landmarker.task`）4fps 检测，写入定长小端二进制 `<entry>/landmarks.bin`（`RBPS v1`，`scale=10000`，`stride=544 B`）与 `landmarks.json`。
+  - 点位与补检修正：实核 `engine.js` `updateFaceMaskTexture` 实际消费 7 组多边形 + 4 单点锚点（去重共 **132** 点，而非交接草稿里的 52 点），补全眼/眉/唇外内圈以避免散射时出现 `(0, 0)` 顶点拖尾伪影；单帧检测采用与网页同源的 `0.22` 阈值 + `isPlausibleFace` 校验 + 上一帧 2.8× 动态紧裁剪 + 5 窗口补检（显著提升小脸/边角脸召回，180s 对比检出从 `23.4%` 升至 `31.0%`）。
+  - `cache-server/prescan_api.py` + `server.py` + `webui.py`：提供 `GET/POST/DELETE /api/prescan/{key}`、`GET /lm/{key}`、启动重置残留 `running` 状态、媒体库 `hasPrescan` 字段，并附 `scripts/check_landmarks.py` 自检工具。
+- **阶段 2（前端兜底）**：
+  - `cache-server/web/player.html`：`boot()` 基于 `info.ranges` 与逐片时长生成 `window.__RB_FULL_TIME_MAP__`（兼容 `mode=cached` 压缩时间轴），`loadedmetadata` 后拉取 `/lm/{key}` 传给 `setPrescan()`。
+  - `content/engine.js`：`lookupPrescan()` 对记录时间戳 `t_ms` 做 O(log N) 二分查找（兼容连续与非连续缓存），仅在 worker `RESULT` 判为无脸时介入兜底并维持 `lastFaceBox` 引导下一帧高倍 ROI；`this.prescan === null` 时线上扩展链路行为 100% 不变。
+
+**实测数据（样本 `avbebe.com_archives_357404`，130 片 × 5s = 650s，1920×1080）**：
+
+| 维度 | 实测结果 | 说明 |
+|---|---|---|
+| 扫描总帧数 / 耗时 | `2629` 帧 @ 4fps / **141.2s**（18.6 fps） | 含全片 130 个 TS 分片，zero upstream fetches |
+| 产物大小 | `1,430,464` 字节（**1.364 MB**） | `nPoints=132`，`stride=544 B`，`check_landmarks.py` 校验 0 错误 |
+| 离线 `hasFace` 占比 | **32.18%**（`846 / 2629`，原 0.30 策略为 `21.15%`） | 注：该影片本身大量片段为无露脸镜头，即使 `0.15` 阈值+7 宫格+四向旋转客观上限亦在 31%–36%，原任务书「≥80% / ≥90%」假设不适用于本样本 |
+| 浏览器 2 分钟 A/B 对照（0–120s，每 500ms 采样 240 次） | 基线（关 prescan）`face_mask`: **31.67%**（76/240）→ 开启后: **47.50%**（114/240），**相对 +50.0%** | `prescan.hits = 558`，`avgRenderFps`: **29.90 fps**（基线 29.18 fps） |
+| 客观 Canvas Diff（`t=57.935s` 远景小脸静止帧） | 差异像素 `11,924 / 921,600`（1.294%），**100.0% 落入人脸 ROI 内**，`diffBboxPx=[552,227,691,392]` | 左上角像素变化 = **0**，`maskCanvas` 左上角非零 = **0**，零多边形拖尾伪影 |
 
 ### 7.5 其他待办
 

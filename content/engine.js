@@ -729,6 +729,10 @@
       this.latestLandmarkTs = 0;
       this.latestLandmarkRecvTs = 0;
       this.lastFaceBox = null; // { minX, minY, maxX, maxY, w, h, cx, cy, area }
+      this.prescan = null;
+      this.prescanLmBuf = null;
+      this.prescanHits = 0;
+      this.prescanMiss = 0;
       this.validFaceStreak = 0;
       this.missStreak = 0;
       this.scanStep = 0;
@@ -1765,23 +1769,46 @@
               this.fadeWeight = 1.0;
               this.reshapeGate = 1.0;
             } else {
-              const wasCropped = !!(msg.roiUsed && (msg.roiUsed.w < 0.99 || msg.roiUsed.h < 0.99));
-              if (wasCropped) {
-                // Immediately release tight small-face ROI lock on miss so next frame searches full-frame
-                this.lastFaceBox = null;
+              let prescanHit = null;
+              if (this.prescan) {
+                const playerSec = Number.isFinite(this.lastCapturedMediaTime)
+                  ? this.lastCapturedMediaTime
+                  : (this.video ? this.video.currentTime : 0);
+                prescanHit = this.lookupPrescan(this.mapPlayerToFullTime(playerSec));
               }
-              if (this.pendingSceneCut || !this.latestLandmarks || this.missStreak >= 3) {
-                this.latestLandmarks = null;
-                this.lastFaceBox = null;
-                this.validFaceStreak = 0;
+              if (prescanHit) {
+                this.latestLandmarks = prescanHit.landmarks;
+                this.latestLandmarkTs = Number.isFinite(msg.timestampMs) ? msg.timestampMs : recvNow;
+                this.latestLandmarkRecvTs = recvNow;
+                this.lastFaceBox = prescanHit.faceBox;
+                this.validFaceStreak = Math.min(this.validFaceStreak + 1, 10);
                 this.missStreak = 0;
-                this.fadeWeight = 0.0;
-                this.reshapeGate = 0.0;
+                this.scanStep = 0;
+                this.fadeWeight = 1.0;
+                this.reshapeGate = 1.0;
+                this.prescanHits++;
               } else {
-                // Brief 1-3 frame same-shot occlusion/motion-blur grace: smoothly soften fade & pull back reshape (no jarring flash)
-                this.missStreak++;
-                this.fadeWeight = Math.max(0.18, 1.0 - this.missStreak * 0.27);
-                this.reshapeGate = Math.max(0.0, 1.0 - this.missStreak * 0.5);
+                if (this.prescan) {
+                  this.prescanMiss++;
+                }
+                const wasCropped = !!(msg.roiUsed && (msg.roiUsed.w < 0.99 || msg.roiUsed.h < 0.99));
+                if (wasCropped) {
+                  // Immediately release tight small-face ROI lock on miss so next frame searches full-frame
+                  this.lastFaceBox = null;
+                }
+                if (this.pendingSceneCut || !this.latestLandmarks || this.missStreak >= 3) {
+                  this.latestLandmarks = null;
+                  this.lastFaceBox = null;
+                  this.validFaceStreak = 0;
+                  this.missStreak = 0;
+                  this.fadeWeight = 0.0;
+                  this.reshapeGate = 0.0;
+                } else {
+                  // Brief 1-3 frame same-shot occlusion/motion-blur grace: smoothly soften fade & pull back reshape (no jarring flash)
+                  this.missStreak++;
+                  this.fadeWeight = Math.max(0.18, 1.0 - this.missStreak * 0.27);
+                  this.reshapeGate = Math.max(0.0, 1.0 - this.missStreak * 0.5);
+                }
               }
             }
             this.pendingSceneCut = false;
@@ -2790,6 +2817,153 @@
       if (this.mutationObserver) this.mutationObserver.disconnect();
     }
 
+    setPrescan(buffer, timeMap) {
+      try {
+        if (!buffer || !(buffer instanceof ArrayBuffer) || buffer.byteLength < 24) {
+          this.prescan = null;
+          return;
+        }
+        const dv = new DataView(buffer);
+        if (
+          dv.getUint8(0) !== 0x52 ||
+          dv.getUint8(1) !== 0x42 ||
+          dv.getUint8(2) !== 0x50 ||
+          dv.getUint8(3) !== 0x53
+        ) {
+          console.warn("[WVB] invalid prescan magic");
+          this.prescan = null;
+          return;
+        }
+        const version = dv.getUint16(4, true);
+        const fps = dv.getUint16(6, true);
+        const count = dv.getUint32(8, true);
+        const nPoints = dv.getUint16(12, true);
+        const scale = dv.getUint16(14, true);
+        const stride = dv.getUint32(16, true);
+        const headerLen = ((24 + 2 * nPoints + 3) >> 2) << 2;
+        if (
+          version !== 1 ||
+          fps <= 0 ||
+          nPoints <= 0 ||
+          nPoints > 478 ||
+          scale <= 0 ||
+          stride !== 16 + 4 * nPoints ||
+          buffer.byteLength < headerLen + count * stride
+        ) {
+          console.warn("[WVB] invalid prescan header fields", { version, fps, count, nPoints, scale, stride });
+          this.prescan = null;
+          return;
+        }
+        const idx = new Uint16Array(nPoints);
+        for (let i = 0; i < nPoints; i++) {
+          const lmIdx = dv.getUint16(24 + i * 2, true);
+          if (lmIdx >= 478) {
+            console.warn("[WVB] prescan point index out of range", lmIdx);
+            this.prescan = null;
+            return;
+          }
+          idx[i] = lmIdx;
+        }
+        this.prescan = {
+          dv,
+          fps,
+          count,
+          nPoints,
+          scale,
+          invScale: 1 / scale,
+          stride,
+          headerLen,
+          idx,
+          timeMap: Array.isArray(timeMap) && timeMap.length > 0 ? timeMap : null,
+        };
+        if (!this.prescanLmBuf) {
+          this.prescanLmBuf = new Float32Array(478 * 4);
+        }
+        this.prescanHits = 0;
+        this.prescanMiss = 0;
+      } catch (err) {
+        console.warn("[WVB] setPrescan failed", err);
+        this.prescan = null;
+      }
+    }
+
+    mapPlayerToFullTime(playerSec) {
+      if (!Number.isFinite(playerSec) || playerSec < 0) return 0;
+      const tm = this.prescan && this.prescan.timeMap;
+      if (!tm || !tm.length) return playerSec;
+      for (let i = 0; i < tm.length; i++) {
+        const seg = tm[i];
+        if (playerSec <= seg.plEnd + 0.001) {
+          return seg.fullStart + Math.max(0, playerSec - seg.plStart);
+        }
+      }
+      const last = tm[tm.length - 1];
+      return last.fullStart + Math.max(0, last.plEnd - last.plStart);
+    }
+
+    lookupPrescan(fullSec) {
+      const ps = this.prescan;
+      if (!ps || ps.count <= 0 || !Number.isFinite(fullSec) || fullSec < 0) return null;
+      const { dv, fps, count, nPoints, invScale, stride, headerLen, idx } = ps;
+      const targetMs = fullSec * 1000;
+
+      // Binary search sorted t_ms records (handles both contiguous timelines and uncached gaps)
+      let lo = 0;
+      let hi = count - 1;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        const tMid = dv.getUint32(headerLen + mid * stride, true);
+        if (tMid < targetMs) lo = mid + 1;
+        else hi = mid;
+      }
+      let bestIdx = lo;
+      let bestTms = dv.getUint32(headerLen + lo * stride, true);
+      if (lo > 0) {
+        const prevTms = dv.getUint32(headerLen + (lo - 1) * stride, true);
+        if (Math.abs(prevTms - targetMs) < Math.abs(bestTms - targetMs)) {
+          bestIdx = lo - 1;
+          bestTms = prevTms;
+        }
+      }
+
+      const maxTolMs = Math.max(300, Math.ceil(1000 / fps));
+      if (Math.abs(bestTms - targetMs) > maxTolMs) return null;
+
+      const off = headerLen + bestIdx * stride;
+      const flags = dv.getUint16(off + 4, true);
+      if ((flags & 1) === 0) return null;
+
+      const bx = dv.getInt16(off + 8, true) * invScale;
+      const by = dv.getInt16(off + 10, true) * invScale;
+      const bw = dv.getInt16(off + 12, true) * invScale;
+      const bh = dv.getInt16(off + 14, true) * invScale;
+      if (bw <= 0 || bh <= 0) return null;
+
+      const buf = this.prescanLmBuf || (this.prescanLmBuf = new Float32Array(478 * 4));
+      buf.fill(0);
+      for (let j = 0; j < nPoints; j++) {
+        const slot = idx[j] * 4;
+        buf[slot] = dv.getInt16(off + 16 + j * 4, true) * invScale;
+        buf[slot + 1] = dv.getInt16(off + 18 + j * 4, true) * invScale;
+      }
+
+      return {
+        landmarks: buf,
+        tMs: bestTms,
+        faceBox: {
+          minX: bx,
+          minY: by,
+          maxX: bx + bw,
+          maxY: by + bh,
+          w: bw,
+          h: bh,
+          cx: bx + bw * 0.5,
+          cy: by + bh * 0.5,
+          area: bw * bh,
+        },
+      };
+    }
+
     getStateSnapshot() {
       const videos = [];
       for (const [id, v] of this.videosMap.entries()) {
@@ -2861,6 +3035,13 @@
         captureStatus: this.captureStatus,
         renderMode: this.renderMode,
         lastError: this.lastError,
+        prescan: {
+          ready: !!this.prescan,
+          hits: this.prescanHits,
+          miss: this.prescanMiss,
+          fps: this.prescan ? this.prescan.fps : 0,
+          count: this.prescan ? this.prescan.count : 0,
+        },
         diagnostics: {
           adapterName: this.adapterName,
           degradeTier: this.degradeTier,

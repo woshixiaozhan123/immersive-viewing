@@ -87,6 +87,46 @@
     splash.style.display = "none";
   }
 
+  // ---- 离线关键点预扫时间轴映射与加载 ---------------------------------------
+  function buildTimeMap(ranges, durations, fallbackDur, mode) {
+    if (mode === "all" || !Array.isArray(ranges) || !ranges.length) return null;
+    const durs = Array.isArray(durations) && durations.length ? durations : null;
+    const fb = Number(fallbackDur) > 0 ? Number(fallbackDur) : 5.0;
+    const durOf = (idx) => (durs && idx < durs.length && durs[idx] > 0 ? Number(durs[idx]) : fb);
+    const out = [];
+    let plCursor = 0;
+    let prevSeg = 0;
+    let fullCursor = 0;
+    for (const r of ranges) {
+      const a = Number(r[0]);
+      const b = Number(r[1]);
+      if (!Number.isFinite(a) || !Number.isFinite(b) || b < a) continue;
+      for (let i = prevSeg; i < a; i += 1) fullCursor += durOf(i);
+      const fullStart = fullCursor;
+      let spanDur = 0;
+      for (let i = a; i <= b; i += 1) spanDur += durOf(i);
+      fullCursor += spanDur;
+      prevSeg = b + 1;
+      out.push({ plStart: plCursor, plEnd: plCursor + spanDur, fullStart });
+      plCursor += spanDur;
+    }
+    return out.length ? out : null;
+  }
+
+  let prescanStarted = false;
+  function loadPrescan() {
+    if (prescanStarted) return;
+    prescanStarted = true;
+    fetch(`/lm/${encodeURIComponent(KEY)}`, { cache: "no-store" })
+      .then((res) => (res.ok ? res.arrayBuffer() : null))
+      .then((buf) => {
+        if (buf && window.__WVB_ENGINE__ && typeof window.__WVB_ENGINE__.setPrescan === "function") {
+          window.__WVB_ENGINE__.setPrescan(buf, window.__RB_FULL_TIME_MAP__);
+        }
+      })
+      .catch(() => {});
+  }
+
   // ---- 缓存区间可视化 -----------------------------------------------------
   function paintTrace() {
     if (!info) return;
@@ -229,6 +269,7 @@
 
     paintTrace();
     updateBadge();
+    window.__RB_FULL_TIME_MAP__ = buildTimeMap(info.ranges, info.durations, info.segmentDuration, MODE);
 
     if (MODE === "all") {
       const n = document.createElement("div");
@@ -243,6 +284,7 @@
     video.addEventListener("loadedmetadata", () => {
       hideSplash();
       enableBeauty();
+      loadPrescan();
       onTimeUpdate();
     }, { once: true });
 
