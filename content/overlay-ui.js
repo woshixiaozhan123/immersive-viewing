@@ -1314,41 +1314,73 @@
 
     // 播放器控制条开关 —— 按域名记忆，用户自己决定哪些站点套我们的条
     (function setupPlayerBarToggle() {
-      const bar = window.RBPlayerBar;
       if (!els.togglePlayerBar || !els.barToggleRow) return;
-      if (!bar) {
-        els.barToggleRow.style.display = "none";
-        return;
-      }
-      try {
-        els.barHostHint.textContent = bar.getHost ? bar.getHost() : "";
-      } catch (_) {}
-      const sync = () => {
+      const hostNow = (function () {
         try {
-          els.togglePlayerBar.checked = !!bar.isEnabled();
-          els.barToggleRow.title = bar.isDefaultOn && bar.isDefaultOn()
-            ? "该站点默认开启，可随时关闭"
-            : "该站点默认关闭，打开后仅对当前域名生效";
+          return (location.hostname || "").toLowerCase();
+        } catch (_) {
+          return "";
+        }
+      })();
+      els.barHostHint.textContent = hostNow;
+
+      const mount = (bar) => {
+        els.togglePlayerBar.disabled = false;
+        try {
+          els.barHostHint.textContent = bar.getHost ? bar.getHost() : hostNow;
         } catch (_) {}
-      };
-      try {
-        if (bar.ready && typeof bar.ready.then === "function") {
-          bar.ready.then(sync).catch(sync);
-        } else {
+        const sync = () => {
+          try {
+            els.togglePlayerBar.checked = !!bar.isEnabled();
+            els.barToggleRow.title = bar.isDefaultOn && bar.isDefaultOn()
+              ? "该站点默认开启，可随时关闭"
+              : "该站点默认关闭，打开后仅对当前域名生效";
+          } catch (_) {}
+        };
+        try {
+          if (bar.ready && typeof bar.ready.then === "function") {
+            bar.ready.then(sync).catch(sync);
+          } else {
+            sync();
+          }
+        } catch (_) {
           sync();
         }
-      } catch (_) {
-        sync();
+        els.togglePlayerBar.addEventListener("change", async () => {
+          const want = els.togglePlayerBar.checked;
+          try {
+            await bar.setEnabled(want);
+          } catch (_) {}
+          sync();
+        });
+        // 面板每次打开时对齐一次（可能被别的标签页改过）
+        window.__WVB_BAR_SYNC__ = sync;
+      };
+
+      if (window.RBPlayerBar) {
+        mount(window.RBPlayerBar);
+        return;
       }
-      els.togglePlayerBar.addEventListener("change", async () => {
-        const want = els.togglePlayerBar.checked;
-        try {
-          await bar.setEnabled(want);
-        } catch (_) {}
-        sync();
-      });
-      // 面板每次打开时对齐一次（可能被别的标签页改过）
-      window.__WVB_BAR_SYNC__ = sync;
+
+      // 拿不到 RBPlayerBar：多半是本标签页在扩展安装/重载之前就打开了，
+      // 面板只是点图标时临时注入的，没带上 player-bar.js。
+      // 不要静默隐藏整行 —— 用户会以为功能没了。这里明说原因，并轮询等它出现。
+      els.togglePlayerBar.disabled = true;
+      els.togglePlayerBar.checked = false;
+      els.barHostHint.textContent = `${hostNow} · 需刷新页面`;
+      els.barToggleRow.title =
+        "控制条脚本还没注入到本页（标签页在扩展重载前打开）。刷新页面后即可用。";
+
+      let tries = 0;
+      const timer = setInterval(() => {
+        if (window.RBPlayerBar) {
+          clearInterval(timer);
+          els.barToggleRow.title = "";
+          mount(window.RBPlayerBar);
+        } else if ((tries += 1) >= 10) {
+          clearInterval(timer);
+        }
+      }, 500);
     })();
 
     // 本站缓存开关 —— 按域名记忆，默认关；开了才会把分片落到磁盘
@@ -1568,7 +1600,18 @@
           if (!panelOpen || busy) return;
           const sk = curKey();
           if (!sk) {
-            hideAll();
+            if (!cb.checked) {
+              hideAll();
+              return;
+            }
+            // 开关开着却没有 key：要么 hook 没注入（旧标签页），要么这站不是 HLS。
+            // 两种都明说，别让面板看起来"什么都没有"。
+            showText(
+              window.__RB_HLS_DEBUG__
+                ? "未识别到可缓存的视频源（本站可能不是 HLS 播放）"
+                : "缓存脚本未注入本页，刷新页面后生效"
+            );
+            hideActions();
             return;
           }
           let d = null;
