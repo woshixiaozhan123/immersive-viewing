@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>播放器 · 实时美颜</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='%23ff4d8d'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="player-page">
+
+<div id="stage">
+  <video id="player" playsinline preload="metadata"></video>
+  <div id="splash">
+    <div class="spinner"></div>
+    <div class="msg" id="splash-msg">正在读取本地分片…</div>
+    <div class="hint" id="splash-hint"></div>
+  </div>
+</div>
+
+<header id="topbar">
+  <a class="back" href="/">← 媒体库</a>
+  <div id="title"></div>
+  <div id="badge"></div>
+</header>
+
+<div id="tracebar">
+  <div class="trace" id="trace">
+    <div class="head" id="trace-head" style="left:0%"></div>
+  </div>
+  <div class="trace-legend">
+    <span><span class="swatch"></span>已缓存区间</span>
+    <span id="trace-time">0:00</span>
+  </div>
+</div>
+
+<!-- 顺序不能变：shim 必须在 engine 之前，engine 必须在 overlay-ui 之前 -->
+<script src="/static/vendor/hls.min.js"></script>
+<script src="/static/shim.js"></script>
+<script src="/static/engine.js"></script>
+<script src="/static/overlay-ui.js"></script>
+
+<script>
+(() => {
+  const KEY = decodeURIComponent((location.pathname.split("/").pop() || "").trim());
+  const qs = new URLSearchParams(location.search);
+  const MODE = qs.get("mode") === "all" ? "all" : "cached";
+
+  const video = document.getElementById("player");
+  const splash = document.getElementById("splash");
+  const splashMsg = document.getElementById("splash-msg");
+  const splashHint = document.getElementById("splash-hint");
+  const topbar = document.getElementById("topbar");
+  const tracebar = document.getElementById("tracebar");
+  const trace = document.getElementById("trace");
+  const traceHead = document.getElementById("trace-head");
+  const traceTime = document.getElementById("trace-time");
+  const titleEl = document.getElementById("title");
+  const badge = document.getElementById("badge");
+
+  let info = null;
+  let hls = null;
+  let hideTimer = null;
+
+  function fmtDur(sec) {
+    const s = Math.max(0, Math.round(Number(sec) || 0));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const ss = s % 60;
+    return h > 0
+      ? `${h}:${String(m).padStart(2, "0")}:${String(ss).padStart(2, "0")}`
+      : `${m}:${String(ss).padStart(2, "0")}`;
+  }
+
+  function showError(msg, hint) {
+    splash.classList.add("err");
+    splash.style.display = "flex";
+    splashMsg.textContent = msg;
+    splashHint.textContent = hint || "";
+  }
+
+  function hideSplash() {
+    splash.style.display = "none";
+  }
+
+  // ---- 缓存区间可视化 -----------------------------------------------------
+  function paintTrace() {
+    if (!info) return;
+    trace.querySelectorAll(".cached").forEach((n) => n.remove());
+    const total = info.totalSegments || 0;
+    if (!total) return;
+    const durs = info.durations && info.durations.length ? info.durations : null;
+    const fallback = info.segmentDuration || 5;
+
+    // 有逐片时长就按真实时长铺（更准），否则按片数比例铺
+    const totalDur = durs ? durs.reduce((a, b) => a + b, 0) : total * fallback;
+    if (!totalDur) return;
+
+    for (const [a, b] of info.ranges || []) {
+      let startDur = 0;
+      for (let i = 0; i < a && i < total; i += 1) startDur += durs ? durs[i] || fallback : fallback;
+      let spanDur = 0;
+      for (let i = a; i <= b && i < total; i += 1) spanDur += durs ? durs[i] || fallback : fallback;
+      const el = document.createElement("div");
+      el.className = "cached";
+      el.style.left = `${(startDur / totalDur) * 100}%`;
+      el.style.width = `${Math.max(0.35, (spanDur / totalDur) * 100)}%`;
+      trace.appendChild(el);
+    }
+  }
+
+  function updateBadge() {
+    if (!info) return;
+    const pct = info.totalSegments ? Math.round((info.cachedSegments / info.totalSegments) * 100) : 0;
+    const modeText = MODE === "all" ? "续缓存" : "仅本地";
+    badge.textContent = `${modeText} · ${info.cachedSegments}/${info.totalSegments} 片 · ${pct}%`;
+  }
+
+  // ---- 进度指示 -----------------------------------------------------------
+  function onTimeUpdate() {
+    const d = video.duration;
+    if (!d || !Number.isFinite(d)) return;
+    traceHead.style.left = `${Math.min(100, (video.currentTime / d) * 100)}%`;
+    traceTime.textContent = `${fmtDur(video.currentTime)} / ${fmtDur(d)}`;
+  }
+
+  // ---- 美颜 ---------------------------------------------------------------
+  function enableBeauty() {
+    const eng = window.__WVB_ENGINE__;
+    if (!eng) return;
+    try {
+      eng.scanVideos();
+      eng.setEnabled(true);
+    } catch (err) {
+      console.warn("[player] beauty enable failed", err);
+    }
+  }
+
+  // ---- 控制条自动隐藏 -----------------------------------------------------
+  function poke() {
+    topbar.classList.remove("hide");
+    tracebar.classList.remove("hide");
+    if (hideTimer) clearTimeout(hideTimer);
+    hideTimer = setTimeout(() => {
+      if (video.paused) return;
+      topbar.classList.add("hide");
+      tracebar.classList.add("hide");
+    }, 2800);
+  }
+
+  // ---- 播放源 -------------------------------------------------------------
+  function attach(src) {
+    if (window.Hls && window.Hls.isSupported()) {
+      hls = new window.Hls({
+        enableWorker: true,
+        lowLatencyMode: false,
+        // 4 小时的长片不限制回缓冲会把内存吃满
+        backBufferLength: 90,
+        maxBufferLength: 30,
+        maxMaxBufferLength: 60,
+      });
+      hls.on(window.Hls.Events.ERROR, (_evt, data) => {
+        if (!data || !data.fatal) return;
+        if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR) {
+          if (data.details === "manifestLoadError") {
+            showError(
+              "本地播放列表读取失败",
+              "可能这条视频还没有缓存任何分片。回到原站播放几秒再回来。"
+            );
+            return;
+          }
+          hls.startLoad();
+          return;
+        }
+        if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR) {
+          hls.recoverMediaError();
+          return;
+        }
+        showError("解码失败", String(data.details || data.type || ""));
+      });
+      hls.loadSource(src);
+      hls.attachMedia(video);
+    } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      video.src = src;
+    } else {
+      showError("这个浏览器不支持 HLS 播放", "请用 Chrome / Edge 打开本页。");
+    }
+  }
+
+  // ---- 启动 ---------------------------------------------------------------
+  async function boot() {
+    if (!KEY) {
+      showError("缺少视频标识", "请从媒体库进入播放页。");
+      return;
+    }
+
+    let lib = null;
+    try {
+      const r = await fetch("/api/library", { cache: "no-store" });
+      lib = await r.json();
+    } catch (_) {}
+
+    const item = lib && (lib.items || []).find((x) => x.key === KEY);
+    if (item) {
+      document.title = `${item.title} · 播放器`;
+      titleEl.textContent = item.title;
+      titleEl.title = item.sourceUrl || item.title;
+    } else {
+      titleEl.textContent = KEY;
+    }
+
+    // 逐片时长（画缓存条用）
+    try {
+      const r = await fetch(`/api/library/${encodeURIComponent(KEY)}/segments`, { cache: "no-store" });
+      if (r.ok) info = await r.json();
+    } catch (_) {}
+
+    if (!info || !info.cachedSegments) {
+      showError(
+        "这条视频还没有缓存",
+        "先到原站把视频播放几秒，分片落盘后刷新本页。"
+      );
+      return;
+    }
+
+    paintTrace();
+    updateBadge();
+
+    if (MODE === "all") {
+      const n = document.createElement("div");
+      n.className = "notice warn";
+      n.textContent = "续缓存模式：未缓存的分片会回源拉取，原站 token 过期后会中断。";
+      document.body.appendChild(n);
+      setTimeout(() => n.remove(), 6000);
+    }
+
+    attach(`/l/${encodeURIComponent(KEY)}/index.m3u8?mode=${MODE}`);
+
+    video.addEventListener("loadedmetadata", () => {
+      hideSplash();
+      enableBeauty();
+      onTimeUpdate();
+    }, { once: true });
+
+    video.addEventListener("timeupdate", onTimeUpdate);
+    video.addEventListener("play", () => { enableBeauty(); poke(); });
+    video.addEventListener("pause", () => { topbar.classList.remove("hide"); tracebar.classList.remove("hide"); });
+
+    // 3 秒还没 metadata，说明 playlist 或首个分片有问题
+    setTimeout(() => {
+      if (video.readyState >= 1) return;
+      if (splash.style.display === "none") return;
+      showError(
+        "加载超时",
+        "首个分片可能拉取失败。试试「仅本地」以外的模式，或回原站再缓存几片。"
+      );
+    }, 12000);
+  }
+
+  // ---- 交互 ---------------------------------------------------------------
+  window.addEventListener("mousemove", poke, { passive: true });
+  window.addEventListener("keydown", (e) => {
+    if (e.target && /input|textarea/i.test(e.target.tagName)) return;
+    const k = e.key.toLowerCase();
+    if (k === " " || k === "k") {
+      e.preventDefault();
+      video.paused ? video.play().catch(() => {}) : video.pause();
+      poke();
+    } else if (k === "arrowright") {
+      video.currentTime = Math.min(video.duration || 0, video.currentTime + 5);
+      poke();
+    } else if (k === "arrowleft") {
+      video.currentTime = Math.max(0, video.currentTime - 5);
+      poke();
+    } else if (k === "f") {
+      const st = document.getElementById("stage");
+      if (document.fullscreenElement) document.exitFullscreen();
+      else st.requestFullscreen().catch(() => {});
+    } else if (k === "m") {
+      video.muted = !video.muted;
+    }
+  });
+
+  video.addEventListener("click", () => {
+    video.paused ? video.play().catch(() => {}) : video.pause();
+    poke();
+  });
+  video.addEventListener("dblclick", () => {
+    const st = document.getElementById("stage");
+    if (document.fullscreenElement) document.exitFullscreen();
+    else st.requestFullscreen().catch(() => {});
+  });
+
+  poke();
+  boot();
+})();
+</script>
+</body>
+</html>

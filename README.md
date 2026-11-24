@@ -12,7 +12,8 @@
 ## 核心特性
 
 - **100% 本机离线推理与渲染**：所有视频帧与人脸关键点均在用户浏览器本地处理，零远端 API、零数据上报。
-- **最小权限 & 按需注入**：仅申请 `activeTab`、`scripting`、`storage`，无常驻后台 Service Worker；未点击扩展图标时不注入任何页面代码。
+- **可选：视频本地缓存 + 内置播放器**（见下方「本地缓存与内置播放器」）：边看边把分片落到本地磁盘，之后用 `http://127.0.0.1:8765/` 打开自带播放器回看，**原站关掉、token 过期都不影响**，美颜面板一模一样地保留。
+- **最小权限 & 按需注入**：美颜引擎申请 `activeTab`、`scripting`、`storage`，未点击扩展图标时不注入页面代码；透明缓存模块（`grab-hook`）只在 MissAV / Javrate / Avbebe 三个域名注入，**不碰其它站点**。
 - **Wink / 剪映专业级 26 项分项美颜（单 Pass WebGL 管线）**：
   - **美肤（7 项）**：磨皮（12-tap 保边双边近似）、质感保留（高频肤质细节还原，避免塑料脸）、美白（高光保护冷白提亮）、红润（苹果肌暖色提气色）、去黑眼圈、淡法令纹、去油光（T 区高光柔化）。
   - **美型（8 项）**：瘦脸（下颌线收窄）、窄颧骨、下巴长短（`-50 ~ +50` 双向精调）、大眼、眼尾上扬（`-50 ~ +50` 双向精调）、瘦鼻、嘴型大小（`-50 ~ +50` 双向精调）、微笑唇；内置纵横比校正与侧脸对称度 `yawFactor` 自动衰减，避免侧脸背景拉扯。
@@ -76,6 +77,25 @@ npm run build
 
 ---
 
+## 本地缓存与内置播放器（可选）
+
+`cache-server/` 是一个可选的本地 FastAPI 服务（`127.0.0.1:8765`），提供两件事：
+
+1. **透明缓存**：扩展把播放器的 m3u8 改写到本地代理，每个分片先问本地、未命中才回源并顺手存一份。零额外流量，看完即已缓存。
+2. **内置播放器**：浏览器打开 `http://127.0.0.1:8765/` 即进入媒体库，点开就是播放器，自带同一套 26 项美颜面板，**不需要扩展也能跑**。
+
+```bash
+cd cache-server
+pip install -r requirements.txt
+python main.py          # 打开 http://127.0.0.1:8765/
+```
+
+- 播放列表由**磁盘状态**现场生成，默认只列已落盘分片，原站 token 过期也能完整回看。
+- 网页侧只对 MissAV / Javrate / Avbebe 生效（域名白名单），不影响任何其它站点。
+- 详细架构、实测数据与踩坑记录见 [HANDOVER.md](HANDOVER.md)。
+
+---
+
 ## iOS Safari 安装与横屏全屏
 
 仓库内置与桌面端完全同步的 iOS Safari 用户脚本：[ios/realtime-beauty-ios.user.js](ios/realtime-beauty-ios.user.js)（同样具备全部 26 项参数、7 档预设、Wink 中文配方解析与可选 478 点追踪）。
@@ -108,12 +128,17 @@ npm run build
 
 ```text
 realtime-beauty/
-├── manifest.json             # MV3 清单（最小权限 + icons + wasm-unsafe-eval）
+├── manifest.json             # MV3 清单（icons + wasm-unsafe-eval）
 ├── icons/                    # 16 / 48 / 128 扩展图标
 ├── popup/                    # 26 项 Wink/剪映专业分项调参面板、预设、JSON 方案与诊断
 ├── content/engine.js         # 主引擎：选源、多播放器适配、EME/CORS探针、WebGL管线、L0-L3降级
+├── content/grab-hook.js      # 透明 HLS 缓存 hook（域名白名单 + 改写 m3u8 到本地代理）
 ├── worker/face-worker.js     # 离主线程 MediaPipe 478 点推理、主脸锁定与 One-Euro 滤波
 ├── ios/                      # iOS Safari 用户脚本（26 项调参 + 美颜剧场全屏 + 90° 横屏）
+├── cache-server/             # 可选本地服务：透明缓存 + 媒体库 + 内置播放器（FastAPI）
+│   ├── hls_proxy.py          #   分片级透明缓存
+│   ├── webui.py              #   媒体库 / 播放器 / 本地播放列表 / 缩略图
+│   └── web/                  #   播放器前端（hls.js + chrome.tabs 垫片 + 复用 engine.js）
 ├── vendor/mediapipe/         # 离线 MediaPipe 模型与 ES Module WASM（npm run setup 拉取）
 ├── test-page/index.html      # 可控边界测试页（双人脸、同源iframe、cover/contain、全屏、EME）
 ├── scripts/                  # setup / check / build 零依赖 Node 脚本

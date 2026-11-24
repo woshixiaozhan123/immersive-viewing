@@ -13,6 +13,12 @@ const REQUIRE_MODELS = process.argv.includes("--require-models");
 
 const JS_FILES = [
   "background/service-worker.js",
+  "background/cache-bridge.js",
+  "background/grab-bridge.js",
+  "content/cache-hook.js",
+  "content/cache-relay.js",
+  "content/grab-hook.js",
+  "content/grab-relay.js",
   "content/engine.js",
   "content/overlay-ui.js",
   "worker/face-worker.js",
@@ -26,6 +32,12 @@ const JS_FILES = [
 const CORE_FILES = [
   "manifest.json",
   "background/service-worker.js",
+  "background/cache-bridge.js",
+  "background/grab-bridge.js",
+  "content/cache-hook.js",
+  "content/cache-relay.js",
+  "content/grab-hook.js",
+  "content/grab-relay.js",
   "content/engine.js",
   "content/overlay-ui.js",
   "worker/face-worker.js",

@@ -1,7 +1,10 @@
 /**
  * MV3 Event-Driven Service Worker (zero idle overhead)
- * Clicking the toolbar icon toggles the in-page Shadow DOM floating ball & beauty panel.
+ * - Loads cache-bridge.js (v2 preserved) and grab-bridge.js (v3 universal video grabber)
+ * - Clicking the toolbar icon toggles the in-page Shadow DOM floating ball & beauty panel.
  */
+importScripts("cache-bridge.js", "grab-bridge.js");
+
 chrome.action.onClicked.addListener(async (tab) => {
   if (!tab || !tab.id) return;
   const tabId = tab.id;
@@ -19,6 +22,6 @@ chrome.action.onClicked.addListener(async (tab) => {
     });
     await chrome.tabs.sendMessage(tabId, { type: "WVB_OPEN_PANEL" });
   } catch (_) {
-    // Restricted browser internal pages (chrome://, edge://, ego://, Chrome Web Store, etc.)
+    // Restricted browser internal pages (chrome://, edge://, Chrome Web Store, etc.)
   }
 });

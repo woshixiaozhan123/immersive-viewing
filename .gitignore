@@ -6,9 +6,17 @@ dist/
 
 # Dependencies & OS files
 node_modules/
+.venv/
+__pycache__/
+*.pyc
 .DS_Store
 Thumbs.db
 *.log
+
+# Local scratch (playwright snapshots, ad-hoc screenshots)
+.playwright-cli/
+
+# Runtime cache of the local player (thumbnails etc. live outside the repo, nothing here)
 
 # Heavy MediaPipe binaries (fetched cleanly via `npm run setup` or bundled in GitHub Releases)
 vendor/mediapipe/vision_bundle.mjs

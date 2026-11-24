@@ -11,7 +11,12 @@
   "permissions": [
     "activeTab",
     "scripting",
-    "storage"
+    "storage",
+    "cookies"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "<all_urls>"
   ],
   "background": {
     "service_worker": "background/service-worker.js"
@@ -25,6 +30,66 @@
     }
   },
   "content_scripts": [
+    {
+      "matches": [
+        "https://*.missav.ws/*",
+        "https://missav.ws/*",
+        "https://*.missav.com/*",
+        "https://missav.com/*",
+        "https://*.javrate.com/*",
+        "https://javrate.com/*",
+        "https://*.avbebe.com/*",
+        "https://avbebe.com/*"
+      ],
+      "js": [
+        "content/grab-hook.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true,
+      "match_about_blank": true
+    },
+    {
+      "matches": [
+        "https://*.missav.ws/*",
+        "https://missav.ws/*",
+        "https://*.missav.com/*",
+        "https://missav.com/*",
+        "https://*.javrate.com/*",
+        "https://javrate.com/*",
+        "https://*.avbebe.com/*",
+        "https://avbebe.com/*"
+      ],
+      "js": [
+        "content/grab-relay.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true,
+      "match_about_blank": true
+    },
+    {
+      "matches": [
+        "https://*.bilibili.com/*",
+        "https://*.youtube.com/*"
+      ],
+      "js": [
+        "content/cache-hook.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    },
+    {
+      "matches": [
+        "https://*.bilibili.com/*",
+        "https://*.youtube.com/*"
+      ],
+      "js": [
+        "content/cache-relay.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": false
+    },
     {
       "matches": [
         "http://*/*",
