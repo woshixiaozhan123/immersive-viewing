@@ -197,4 +197,37 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ unmarked: false, reason: "missing_key" });
     return false;
   }
+
+  // 4) 用户在美颜面板里手动删缓存 -> DELETE /api/library[/{key}]
+  //    走后台是因为 SW 有 host_permissions，不受页面 CORS / PNA 限制。
+  if (msg.type === "rb-cache-delete") {
+    const p = msg.payload || {};
+    const scope = p.scope === "site" ? "site" : "video";
+    const url =
+      scope === "site"
+        ? `${RB_GRAB_LOCAL}/api/library?host=${encodeURIComponent(p.host || "")}`
+        : `${RB_GRAB_LOCAL}/api/library/${encodeURIComponent(p.key || "")}`;
+
+    fetch(url, { method: "DELETE", cache: "no-store" })
+      .then(async (r) => {
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          return { ok: false, status: r.status, ...data };
+        }
+        rbGrabServerOnline = true;
+        // 缓存条目变了，尽快刷新 pageKey 列表，避免继续命中已删条目
+        setTimeout(() => void refreshRbGrabKeys(true), 300);
+        return { ok: true, scope, ...data };
+      })
+      .then(sendResponse)
+      .catch((err) => {
+        rbGrabServerOnline = false;
+        sendResponse({
+          ok: false,
+          offline: true,
+          reason: err && err.message ? err.message : "offline",
+        });
+      });
+    return true;
+  }
 });

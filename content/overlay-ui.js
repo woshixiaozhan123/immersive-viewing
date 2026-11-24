@@ -693,6 +693,9 @@
     .btn.ghost:hover { background: #475569; }
     .btn.small { flex: 1 1 auto; padding: 5px 8px; font-size: 11px; }
     .link-btn { background: none; border: none; color: #38bdf8; font-size: 11px; cursor: pointer; padding: 0; }
+    .link-btn.danger { color: #f87171; }
+    .link-btn.danger:hover { color: #fca5a5; text-decoration: underline; }
+    .link-btn:disabled { color: #64748b; cursor: default; text-decoration: none; }
 
     .switch { position: relative; display: inline-block; width: 40px; height: 22px; flex-shrink: 0; }
     .switch input { opacity: 0; width: 0; height: 0; }
@@ -802,6 +805,10 @@
             </label>
           </div>
           <div id="cacheInfo" class="meta" style="margin-top:6px;display:none"></div>
+          <div id="cacheActions" style="margin-top:7px;display:none;justify-content:space-between;align-items:center;gap:8px">
+            <button id="btnDeleteVideoCache" class="link-btn danger" type="button">删除本视频</button>
+            <button id="btnDeleteSiteCache" class="link-btn danger" type="button">清空本站</button>
+          </div>
         </section>
 
         <section class="card">
@@ -928,6 +935,9 @@
       toggleSiteCache: $("toggleSiteCache"),
       cacheHostHint: $("cacheHostHint"),
       cacheInfo: $("cacheInfo"),
+      cacheActions: $("cacheActions"),
+      btnDeleteVideoCache: $("btnDeleteVideoCache"),
+      btnDeleteSiteCache: $("btnDeleteSiteCache"),
       presetBar: $("presetBar"),
       activePresetLabel: $("activePresetLabel"),
       skinSliders: $("skinSliders"),
@@ -1217,6 +1227,11 @@
       panelOpen = true;
       els.panel.classList.remove("hidden");
       els.fab.classList.add("hidden");
+      // 面板一打开就对齐一次缓存状态。必须放在 engine 相关调用之前：
+      // 某些页面上 scanVideos()/renderUI() 可能抛错，否则这里的刷新会被跳过。
+      try {
+        if (window.__WVB_CACHE_SYNC__) window.__WVB_CACHE_SYNC__();
+      } catch (_) {}
       engine.scanVideos();
       if (engine.video && engine.captureStatus === "waiting") engine.runProtectionAndProbe();
       renderUI();
@@ -1400,38 +1415,256 @@
         await writeMap(map);
       });
 
-      // 显示当前视频已缓存多少（能拿到本地服务才有意义）
+      // 缓存状态 + 手动删除（能拿到本地服务才有意义）
       if (els.cacheInfo) {
-        const tick = async () => {
-          if (!cb.checked) {
-            els.cacheInfo.style.display = "none";
-            return;
-          }
+        const API = "http://127.0.0.1:8765";
+        let siteStat = { site: "", count: 0, bytes: 0, at: 0 };
+        let busy = false;
+        let flashTimer = 0;
+        let lastInfo = null;
+
+        // 网页里靠 grab-hook 暴露的 safeKey；本地播放器页靠 player.html 暴露的 key
+        const curKey = () => {
           const dbg = window.__RB_HLS_DEBUG__;
-          const sk = dbg && dbg.getSafeKey ? dbg.getSafeKey() : "";
-          if (!sk) return;
+          if (dbg && typeof dbg.getSafeKey === "function") {
+            try {
+              const k = dbg.getSafeKey();
+              if (k) return k;
+            } catch (_) {}
+          }
+          return window.__RB_LOCAL_KEY__ || "";
+        };
+
+        // safeKey 形如 `avbebe.com_archives_357404`，前半段才是视频真正所属站点。
+        // 本地播放器页的 host 是 127.0.0.1，不能拿它当「本站」，否则会删错目标。
+        const siteOf = (sk) => {
+          const i = sk ? sk.indexOf("_") : -1;
+          return i > 0 ? sk.slice(0, i).toLowerCase() : host;
+        };
+
+        const reqJSON = async (url, init) => {
+          const r = await fetch(url, Object.assign({ cache: "no-store" }, init || {}));
+          const d = await r.json().catch(() => ({}));
+          if (!r.ok) {
+            throw Object.assign(new Error(`HTTP ${r.status}`), { status: r.status, data: d });
+          }
+          return d;
+        };
+
+        const fmtMB = (bytes) => {
+          const mb = (Number(bytes) || 0) / 1048576;
+          return mb >= 10 ? `${Math.round(mb)} MB` : `${mb.toFixed(1)} MB`;
+        };
+
+        // 直连优先（本地页同源；网页靠服务端的 CORS + PNA 头）；
+        // 被浏览器拦下时转后台 service worker（它有 host_permissions，不受 CORS 约束）
+        const callDelete = async (scope, sk, site) => {
+          const target = site || host;
+          const url =
+            scope === "site"
+              ? `${API}/api/library?host=${encodeURIComponent(target)}`
+              : `${API}/api/library/${encodeURIComponent(sk)}`;
           try {
-            const r = await fetch(
-              `http://127.0.0.1:8765/api/video/${encodeURIComponent(sk)}`,
-              { cache: "no-store" }
-            );
-            if (!r.ok) throw new Error("bad");
-            const d = await r.json();
-            if (!d || !d.exists) {
-              els.cacheInfo.style.display = "";
-              els.cacheInfo.textContent = "本地还没有这条视频的分片";
-              return;
-            }
-            const total = d.totalSegments || 0;
-            const cached = d.cachedSegments || 0;
-            const pct = total ? Math.round((cached / total) * 100) : 0;
-            els.cacheInfo.style.display = "";
-            els.cacheInfo.textContent = `已缓存 ${cached}/${total} 片 · ${pct}%`;
-          } catch (_) {
-            els.cacheInfo.style.display = "";
-            els.cacheInfo.textContent = "本地服务未启动，缓存不可用";
+            return await reqJSON(url, { method: "DELETE" });
+          } catch (err) {
+            const viaBg = await new Promise((resolve) => {
+              let settled = false;
+              const done = (v) => {
+                if (!settled) {
+                  settled = true;
+                  resolve(v);
+                }
+              };
+              try {
+                if (typeof chrome === "undefined" || !chrome.runtime || !chrome.runtime.sendMessage) {
+                  done(null);
+                  return;
+                }
+                chrome.runtime.sendMessage(
+                  { type: "rb-cache-delete", payload: { scope, key: sk, host: target } },
+                  (res) => {
+                    void chrome.runtime.lastError;
+                    done(res || null);
+                  }
+                );
+                setTimeout(() => done(null), 1800);
+              } catch (_) {
+                done(null);
+              }
+            });
+            if (viaBg && viaBg.ok) return viaBg;
+            throw err;
           }
         };
+
+        const refreshSiteStat = async (site, force) => {
+          const target = (site || host).toLowerCase();
+          if (!force && siteStat.site === target && Date.now() - siteStat.at < 20000) {
+            return siteStat;
+          }
+          try {
+            const d = await reqJSON(`${API}/api/library`);
+            const items = (d.items || []).filter(
+              (x) => String(x.site || "").toLowerCase() === target
+            );
+            siteStat = {
+              site: target,
+              count: items.length,
+              bytes: items.reduce((s, x) => s + (Number(x.cachedBytes) || 0), 0),
+              at: Date.now(),
+            };
+          } catch (_) {
+            siteStat = { site: target, count: 0, bytes: 0, at: Date.now() };
+          }
+          return siteStat;
+        };
+
+        const hideActions = () => {
+          if (els.cacheActions) els.cacheActions.style.display = "none";
+        };
+        const hideAll = () => {
+          els.cacheInfo.style.display = "none";
+          hideActions();
+        };
+        const showText = (t) => {
+          els.cacheInfo.style.display = "";
+          els.cacheInfo.textContent = t;
+        };
+
+        const renderActions = async (d, sk) => {
+          if (!els.cacheActions) return;
+          const site = siteOf(sk);
+          const st = await refreshSiteStat(site);
+          const hasEntry = !!(d && d.exists);
+          const n = hasEntry ? Number(d.cachedSegments) || 0 : 0;
+          if (els.btnDeleteVideoCache) {
+            els.btnDeleteVideoCache.style.display = hasEntry && n > 0 ? "" : "none";
+            els.btnDeleteVideoCache.textContent = `删除本视频 · ${n} 片`;
+            els.btnDeleteVideoCache.disabled = busy;
+          }
+          if (els.btnDeleteSiteCache) {
+            const sameSite = site === host;
+            els.btnDeleteSiteCache.style.display = st.count > 0 ? "" : "none";
+            els.btnDeleteSiteCache.textContent =
+              `${sameSite ? "清空本站" : "清空该站"} · ${st.count} 条 · ${fmtMB(st.bytes)}`;
+            els.btnDeleteSiteCache.disabled = busy;
+          }
+          els.cacheActions.style.display =
+            (hasEntry && n > 0) || st.count > 0 ? "flex" : "none";
+        };
+
+        const flash = (msg, ms) => {
+          showText(msg);
+          hideActions();
+          if (flashTimer) clearTimeout(flashTimer);
+          flashTimer = setTimeout(() => {
+            flashTimer = 0;
+            void tick();
+          }, ms || 3800);
+        };
+
+        const tick = async () => {
+          // 面板没开就别轮询，省得每个标签页每秒都在打本地服务
+          if (!panelOpen || busy) return;
+          const sk = curKey();
+          if (!sk) {
+            hideAll();
+            return;
+          }
+          let d = null;
+          try {
+            d = await reqJSON(`${API}/api/video/${encodeURIComponent(sk)}`);
+          } catch (_) {
+            lastInfo = null;
+            showText("本地服务未启动，缓存不可用");
+            hideActions();
+            return;
+          }
+          if (!d || !d.exists) {
+            lastInfo = null;
+            if (!cb.checked) {
+              hideAll();
+              return;
+            }
+            showText("本地还没有这条视频的分片");
+            await renderActions(null, sk);
+            return;
+          }
+          lastInfo = d;
+          const total = Number(d.totalSegments) || 0;
+          const cached = Number(d.cachedSegments) || 0;
+          const pct = total ? Math.round((cached / total) * 100) : 0;
+          showText(
+            `已缓存 ${cached}/${total} 片 · ${pct}% · ${fmtMB(d.cachedBytes)}`
+          );
+          await renderActions(d, sk);
+        };
+
+        // -- 删除本视频 ------------------------------------------------------
+        if (els.btnDeleteVideoCache) {
+          els.btnDeleteVideoCache.addEventListener("click", async () => {
+            if (busy) return;
+            const sk = curKey();
+            if (!sk) return;
+            const site = siteOf(sk);
+            const d = lastInfo || {};
+            const n = Number(d.cachedSegments) || 0;
+            const size = fmtMB(d.cachedBytes);
+            let msg = `删除这条视频在本地磁盘的缓存？\n\n${n} 个分片 · ${size}`;
+            if (window.__RB_LOCAL_KEY__ && sk === window.__RB_LOCAL_KEY__) {
+              msg += "\n\n注意：这个页面正在播放它，删除后需要刷新页面才能重新加载。";
+            }
+            if (cb.checked) {
+              msg +=
+                "\n\n注意：本站缓存开关还开着，播放中的视频会从当前位置重新开始缓存。想彻底清掉，请先关掉上面的开关。";
+            }
+            if (!window.confirm(msg)) return;
+            busy = true;
+            try {
+              await callDelete("video", sk, site);
+              await refreshSiteStat(site, true);
+              lastInfo = null;
+              flash(`已删除本视频缓存 · ${n} 片 · ${size}`, 4200);
+            } catch (_) {
+              flash("删除失败：本地服务不可用", 4200);
+            } finally {
+              busy = false;
+            }
+          });
+        }
+
+        // -- 清空本站 --------------------------------------------------------
+        if (els.btnDeleteSiteCache) {
+          els.btnDeleteSiteCache.addEventListener("click", async () => {
+            if (busy) return;
+            const site = siteOf(curKey());
+            const st = await refreshSiteStat(site);
+            if (!st.count) return;
+            const msg =
+              `清空 ${site} 在本地的全部缓存？\n\n` +
+              `共 ${st.count} 条 · ${fmtMB(st.bytes)}\n\n此操作不可撤销。`;
+            if (!window.confirm(msg)) return;
+            busy = true;
+            try {
+              const res = await callDelete("site", "", site);
+              const n = (res && Array.isArray(res.deleted) && res.deleted.length) || 0;
+              const fail = (res && Array.isArray(res.failed) && res.failed.length) || 0;
+              lastInfo = null;
+              await refreshSiteStat(site, true);
+              flash(
+                `已清空本站 ${n} 条 · ${fmtMB(res && res.freedBytes)}` +
+                  (fail ? ` · ${fail} 条失败` : ""),
+                5000
+              );
+            } catch (_) {
+              flash("删除失败：本地服务不可用", 4200);
+            } finally {
+              busy = false;
+            }
+          });
+        }
+
+        window.__WVB_CACHE_SYNC__ = tick;
         tick();
         setInterval(tick, 4000);
       }

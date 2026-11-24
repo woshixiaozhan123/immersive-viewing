@@ -45,6 +45,8 @@
 <script>
 (() => {
   const KEY = decodeURIComponent((location.pathname.split("/").pop() || "").trim());
+  // 供美颜面板的「删除本视频缓存」识别当前条目（网页里由 grab-hook 提供 safeKey）
+  window.__RB_LOCAL_KEY__ = KEY;
   const qs = new URLSearchParams(location.search);
   const MODE = qs.get("mode") === "all" ? "all" : "cached";
 

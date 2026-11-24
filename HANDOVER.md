@@ -41,6 +41,7 @@
 ✅ v4 透明缓存      三家站点实测跑通（边看边存，零额外流量）
 ✅ 缓存按站开关     默认全关，用户在面板里自行开启某站，按域名记忆，可中途热切
 ✅ 缓存自动清理     保留 N 天 + 总容量上限，后台巡检，媒体库可手动立刻清
+✅ 缓存手动删除     面板里「删除本视频 / 清空本站」，确认后立即释放磁盘
 ✅ 原站控制条       player-bar.js：在任意站点原视频上套自制控制条，按域名开关，不跳页
 ✅ 本地媒体库       GET / 列出已缓存视频（缩略图/进度/删除/清理规则），离线兜底用
 ⬜ 关键点预扫       未开始（原始设计文档的核心目标，见 7.3）
@@ -180,6 +181,29 @@ API：`window.RBPlayerBar.setEnabled(bool)` / `isEnabled()` / `refresh()` / `rea
 - `POST /api/maintenance/sweep?dry_run=true` 可以只看会删什么
 
 用 `meta.lastAccessAt` 而不是目录 mtime 的原因：读分片会刷新 `lastAccessAt`，能真实反映"最近有没有看"；mtime 只在写文件时变。
+
+#### 手动删除（**2026-11-24 新增**）
+
+自动清理之外，用户随时能自己删。入口在美颜面板「当前视频」卡片、缓存进度下面同一行：
+
+```
+已缓存 130/374 片 · 35% · 70 MB
+删除本视频 · 130 片          清空本站 · 1 条 · 70 MB
+```
+
+| 按钮 | 调用的接口 | 作用 |
+|---|---|---|
+| **删除本视频** | `DELETE /api/library/{key}` | 只删当前这条视频的整个缓存条目 |
+| **清空本站** / **清空该站** | `DELETE /api/library?host=<site>` | 删该站点在本地的全部条目 |
+
+- 两个按钮都要过 `confirm()`，文案里写明片数、体积、是否不可撤销
+- **目标站点取自 `safeKey` 的前半段**（`avbebe.com_archives_357404` → `avbebe.com`），不是 `location.hostname`。本地播放器页的 host 是 `127.0.0.1`，直接拿 host 会删错目标；两者不一致时按钮文案自动变成「清空该站」
+- 如果「本站缓存」开关还开着，视频会从当前位置重新缓存，确认框里会明确提示
+- 在本地播放器页删当前视频会中断播放，确认框同样会提示
+
+**请求路径**：面板先直连 `127.0.0.1:8765`（本地页同源；网页靠服务端的 CORS + `Access-Control-Allow-Private-Network` 头）。直连被浏览器拦下时，转 `chrome.runtime.sendMessage({type:"rb-cache-delete"})` 交给 service worker —— 它有 `host_permissions`，不受 CORS 约束。
+
+删除动作全部落到 `hls_cache.delete_video()` 的三层兜底，**不会再出现把服务删崩的情况**。
 
 ---
 
@@ -619,6 +643,8 @@ rbpPlayerBarHosts { "missav.ws": true } 播放器控制条，无条目=三站默
 15. **`grab-hook.js` 在 MAIN world，读不到 `chrome.storage`** —— 任何配置都必须由 `grab-relay.js`（ISOLATED）读好，再经 `sessionStorage` + `postMessage` 传进去。别在 hook 里直接调 chrome API
 16. **自动清理只能走 `hls_cache.delete_video()`** —— 里面有三层兜底；自己写 `rmtree` 会重蹈「DELETE 打死服务」的覆辙
 17. **缓存目录里 `_` 开头的目录不参与扫描** —— 那是删除失败时的 `_trash` 兜底位。写测试数据时别用 `_` 开头，否则会被当成 trash 跳过（踩过一次）
+18. **「清空本站」的目标站点取自 `safeKey` 前缀，不是 `location.hostname`** —— 本地播放器页 host 是 `127.0.0.1`，用它当目标会删错条目（或一条都删不到）。两者不一致时按钮文案自动切成「清空该站」
+19. **面板里的删除不要只写直连 fetch** —— 网页到 `127.0.0.1` 可能被 CORS / Private Network Access 拦，必须保留 `rb-cache-delete` 走 service worker 的兜底路径
 
 ---
 

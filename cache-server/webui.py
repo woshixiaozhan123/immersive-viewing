@@ -410,6 +410,40 @@ def api_delete(safe_key: str) -> dict:
     return {"deleted": ok, "key": safe_key}
 
 
+@router.delete("/api/library")
+def api_delete_by_host(host: str = Query(..., min_length=1)) -> dict:
+    """按站点清空缓存（美颜面板里的「清空本站缓存」）。
+
+    只删 `safe_key` 站点部分**完全匹配**的条目，不做后缀模糊匹配，
+    避免 `a.com` 误伤 `nota.com`。删除一律走 `delete_video()` 的三层兜底。
+    """
+    target = (host or "").strip().lower()
+    if not target:
+        raise HTTPException(status_code=400, detail="empty host")
+
+    deleted: list[str] = []
+    failed: list[str] = []
+    freed = 0
+    for item in list_library():
+        if (item.get("site") or "").lower() != target:
+            continue
+        key = item["key"]
+        freed += int(item.get("cachedBytes") or 0)
+        if _cache().delete_video(key):
+            deleted.append(key)
+        else:
+            failed.append(key)
+
+    logger.info(
+        "[webui][delete-site] %s -> deleted=%d failed=%d freed=%.1fMB",
+        target,
+        len(deleted),
+        len(failed),
+        freed / 1048576,
+    )
+    return {"host": target, "deleted": deleted, "failed": failed, "freedBytes": freed}
+
+
 # ---------------------------------------------------------------------------
 # 缩略图：用 ffmpeg 从已缓存分片里抽一帧（失败就 404，前端用占位色块）
 # ---------------------------------------------------------------------------
