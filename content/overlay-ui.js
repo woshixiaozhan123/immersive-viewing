@@ -787,6 +787,13 @@
             <span id="badgeCapture" class="badge neutral">取帧：等待中</span>
             <span id="badgeMode" class="badge neutral">模式：待就绪</span>
           </div>
+          <div class="row-between" id="barToggleRow" style="margin-top:11px">
+            <span class="label">播放器控制条 <span id="barHostHint" class="hint-muted"></span></span>
+            <label class="switch" title="在当前站点启用自制播放器控制条（按域名记忆，随时可关）">
+              <input type="checkbox" id="togglePlayerBar" />
+              <span class="slider"></span>
+            </label>
+          </div>
         </section>
 
         <section class="card">
@@ -906,6 +913,9 @@
       badgeProtection: $("badgeProtection"),
       badgeCapture: $("badgeCapture"),
       badgeMode: $("badgeMode"),
+      barToggleRow: $("barToggleRow"),
+      togglePlayerBar: $("togglePlayerBar"),
+      barHostHint: $("barHostHint"),
       presetBar: $("presetBar"),
       activePresetLabel: $("activePresetLabel"),
       skinSliders: $("skinSliders"),
@@ -1274,6 +1284,45 @@
       fabHiddenByUser = true;
       closePanel();
     });
+
+    // 播放器控制条开关 —— 按域名记忆，用户自己决定哪些站点套我们的条
+    (function setupPlayerBarToggle() {
+      const bar = window.RBPlayerBar;
+      if (!els.togglePlayerBar || !els.barToggleRow) return;
+      if (!bar) {
+        els.barToggleRow.style.display = "none";
+        return;
+      }
+      try {
+        els.barHostHint.textContent = bar.getHost ? bar.getHost() : "";
+      } catch (_) {}
+      const sync = () => {
+        try {
+          els.togglePlayerBar.checked = !!bar.isEnabled();
+          els.barToggleRow.title = bar.isDefaultOn && bar.isDefaultOn()
+            ? "该站点默认开启，可随时关闭"
+            : "该站点默认关闭，打开后仅对当前域名生效";
+        } catch (_) {}
+      };
+      try {
+        if (bar.ready && typeof bar.ready.then === "function") {
+          bar.ready.then(sync).catch(sync);
+        } else {
+          sync();
+        }
+      } catch (_) {
+        sync();
+      }
+      els.togglePlayerBar.addEventListener("change", async () => {
+        const want = els.togglePlayerBar.checked;
+        try {
+          await bar.setEnabled(want);
+        } catch (_) {}
+        sync();
+      });
+      // 面板每次打开时对齐一次（可能被别的标签页改过）
+      window.__WVB_BAR_SYNC__ = sync;
+    })();
 
     // Tabs
     const tabs = shadow.querySelectorAll(".tab");

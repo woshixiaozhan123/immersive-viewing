@@ -24,9 +24,10 @@
 **最终目标**（尚未完成）：缓存人脸关键点，让美颜在播放时**永不掉妆**。
 
 > ⚠️ **方向约定（2026-11-24 用户明确）**
-> 1. 抖音 / B站 / YouTube **保留它们自带的播放器**，只叠加美颜层，**不要接管它们的控制条**。
+> 1. 抖音 / B站 / YouTube **保留它们自带的播放器**，只叠加美颜层，**默认不接管它们的控制条**。
 > 2. 那三个目标站播放器简陋，**在原页面里**套我们自己的控制条，**不要跳到 127.0.0.1 单开网页**。
 > 3. 本地媒体库页只作为兜底入口存在，不是主交互路径。
+> 4. 控制条**不做站点硬限制**：全站注入，谁能用由用户开关决定，按域名记忆。
 
 ---
 
@@ -36,8 +37,8 @@
 ✅ 美颜引擎         26 项效果、7 档预设、中文配方解析、XGPlayer/Plyr/B站/YouTube 适配（全站）
 ✅ 本地缓存服务     FastAPI，curl_cffi 传输，ffmpeg 合并，LRU 清理
 ✅ v4 透明缓存      三家站点实测跑通（边看边存，零额外流量）
-✅ 原站控制条       player-bar.js：在目标站原视频上直接套自制控制条，不跳页、不新开窗口
-✅ 域名白名单       grab-hook / player-bar 只注入三家站点，不影响无关网站
+✅ 原站控制条       player-bar.js：在任意站点原视频上套自制控制条，按域名开关，不跳页
+✅ 域名白名单       grab-hook 只注入三家站点；player-bar 全站注入但默认只在三家开
 ✅ 本地媒体库       GET / 列出已缓存视频（缩略图/进度/删除），离线兜底用
 ⬜ 关键点预扫       未开始（原始设计文档的核心目标，见 7.3）
 ```
@@ -126,8 +127,20 @@
 - **只操作 `<video>` 标准 API**（`play/pause/currentTime/volume/playbackRate`），所以 flowplayer / plyr / 自研播放器统统能接管 —— 它们最终都得落到这个元素上。
 - 原站控制条按类名白名单隐藏（`.fp-controls` / `.plyr__controls` / `.xgplayer-controls` …），**只隐藏控制条行**，播放器外壳和点击层保留，不破坏原站交互。
 - 全屏请求的是**容器**而不是 `<video>`：`engine.js` 在 `fullscreenElement === video` 时会主动 `hideCanvas()` 回退原生，美颜就没了。
-- 作用域与 `grab-hook` 一致（missav / javrate / avbebe），**抖音 / B站 / YouTube 一律不接管**。
 - 同一份 `player-bar.js` 也被本地媒体库播放器页复用（`window.RBPlayerBar.attach(video)`）。
+
+**开关（重点）**：`player-bar.js` 注入全站，但**是否挂载由用户决定**，配置存在 `chrome.storage.local` 的 `rbpPlayerBarHosts`，**按域名记忆**：
+
+| 站点 | 默认 | 说明 |
+|---|---|---|
+| missav / javrate / avbebe | **开** | 自带播放器最简陋，直接接管 |
+| 其它任意站点 | **关** | 用户想要就去面板里打开，只对该域名生效 |
+
+开关位置：**美颜悬浮球 → 展开面板 → 「当前视频」卡片底部「播放器控制条 ⟷ <当前域名>」**。
+
+API：`window.RBPlayerBar.setEnabled(bool)` / `isEnabled()` / `refresh()` / `ready`（Promise）。
+
+改配置后**实时生效**，不用刷新页面。
 
 ---
 
@@ -137,9 +150,9 @@
 
 | 文件 | 行数 | 职责 |
 |---|---|---|
-| `manifest.json` | 155 | MV3 配置。grab-hook / player-bar **只注入三家站点**（已收窄） |
+| `manifest.json` | 155 | MV3 配置。grab-hook 只注入三家站点；player-bar 全站注入（挂不挂载看开关） |
 | `content/grab-hook.js` | ~330 | **v4 核心**。域名白名单 + hook `Hls.loadSource` + 原生 `video.src` |
-| `content/player-bar.js` | ~420 | **原站内嵌控制条**。播放/进度/音量/倍速/全屏，只操作 video 标准 API |
+| `content/player-bar.js` | ~500 | **原站内嵌控制条**。播放/进度/音量/倍速/全屏 + 按域名开关（`chrome.storage.local`） |
 | `content/grab-relay.js` | 140 | ISOLATED world 桥接，把 pageKey / keys / serverOnline 同步给 MAIN |
 | `background/grab-bridge.js` | 200 | 每 60 秒同步 `/api/keys`，提供 `rb-grab-init` |
 | `content/engine.js` | 2700+ | 美颜渲染引擎（WebGL 26 项）。**同时被本地播放器页复用** |
@@ -445,6 +458,24 @@ window.__RB_CHROME_SHIM__                     // 应为 true
 document.getElementById('badge').textContent  // 仅本地 · 130/374 片 · 35%
 ```
 
+播放器控制条：
+
+```js
+window.RBPlayerBar.isEnabled()        // 当前域名是否启用
+window.RBPlayerBar.getHost()          // 当前域名
+window.RBPlayerBar.isDefaultOn()      // 是否属于默认开启的三站
+window.RBPlayerBar.setEnabled(true)   // 手动开关（立刻挂载/卸载，不用刷新）
+window.RBPlayerBar.ready              // Promise，boot 完成后 resolve
+```
+
+看/改配置（原生扩展页用 `chrome.storage.local`，本地播放器页是 shim 垫的 localStorage）：
+
+```js
+// 本地播放器页
+JSON.parse(localStorage.getItem('rbp:rbpPlayerBarHosts'))
+// 形如 {"missav.ws":true,"www.douyin.com":false}；没有条目就走默认值
+```
+
 ### 9.6 服务端日志
 
 关键行格式：
@@ -503,7 +534,8 @@ RB_GRAB_IMPERSONATE=chrome      # curl_cffi 指纹
 10. **进度/大小一律以磁盘扫描为准** —— `meta.cachedCount` / `cachedBytes` 是增量值，会虚高
 11. **删缓存的代码必须 `except BaseException`** —— `shutil.rmtree` 可能被环境垫片用 `SystemExit` 中止，`except Exception` 接不住，整个服务会死
 12. **控制条只能操作 `<video>` 标准 API** —— 不要碰具体播放器框架的内部状态；全屏要请求**容器**，请求 `<video>` 会让 engine 回退原生、美颜消失
-13. **抖音 / B站 / YouTube 不要接管控制条** —— 用户明确要求保留它们自带的播放器，只叠美颜
+13. **抖音 / B站 / YouTube 默认不要接管控制条** —— 用户明确要求保留它们自带的播放器。控制条改成「全站注入 + 按域名开关」，这些站默认关，用户自己开了才生效
+14. **本地播放器页的脚本顺序：`hls.min.js → shim.js → player-bar.js → engine.js → overlay-ui.js`** —— `player-bar` 必须在 `shim` **之后**，否则它读配置时走无前缀 localStorage、写配置时走 shim 的 `rbp:` 前缀，读写键不一致，开关状态刷新就丢
 
 ---
 

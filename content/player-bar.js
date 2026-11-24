@@ -1,18 +1,20 @@
 /**
  * Realtime Beauty · In-page Player Bar (原站页面内的增强播放器控制条)
  *
- * 目标：**不新开网页**，直接在目标站点自己的页面上，把原视频包一层我们自己的控制条。
- * 原站的播放/暂停/seek 逻辑不动（操作的还是同一个 <video>），只把简陋的控制条换成我们的。
+ * **不新开网页**：直接在站点自己的页面上，给主 <video> 挂一层我们的控制条。
+ * 原站的播放/暂停/seek 逻辑不动（操作的还是同一个 <video>），只把控制条换成我们的。
  *
- * 作用域：missav / javrate / avbebe（与 grab-hook 白名单一致）。
- * 抖音 / B站 / YouTube 不接管 —— 它们自带播放器已经很完整，只保留美颜层。
+ * 作用域：**全站可用**，但是否启用由用户在美颜面板里自行开关，**按域名记忆**。
+ *   - missav / javrate / avbebe 默认开（这三个站自带播放器最简陋）
+ *   - 其它站点默认关，用户开了才生效（抖音 / B站 等保留它们自己的播放器）
  *
  * 同一份代码也供本地媒体库播放器页复用：window.RBPlayerBar.attach(video)。
  */
 (() => {
   if (window.RBPlayerBar) return;
 
-  const ALLOW_HOST = /(^|\.)(missav\.[a-z]+|javrate\.[a-z]+|avbebe\.[a-z]+|127\.0\.0\.1|localhost)$/i;
+  const DEFAULT_ON = /(^|\.)(missav\.[a-z]+|javrate\.[a-z]+|avbebe\.[a-z]+|127\.0\.0\.1|localhost)$/i;
+  const STORE_KEY = "rbpPlayerBarHosts";
 
   const ICON = {
     play: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>',
@@ -42,21 +44,18 @@
 .rbp-btn:hover{background:rgba(255,255,255,.16)}
 .rbp-btn svg{width:20px;height:20px;fill:#fff;display:block}
 .rbp-time{flex:0 0 auto;min-width:44px;text-align:center;color:#d8deea;letter-spacing:.2px}
-.rbp-seek{-webkit-appearance:none;appearance:none;flex:1 1 auto;height:4px;border-radius:99px;
+.rbp-seek{-webkit-appearance:none;appearance:none;flex:1 1 auto;min-width:0;height:4px;border-radius:99px;
   background:rgba(255,255,255,.26);outline:none;cursor:pointer;margin:0 2px;
   background-image:linear-gradient(#ff4d8d,#ff4d8d);background-repeat:no-repeat;
   background-size:0% 100%}
 .rbp-seek::-webkit-slider-thumb{-webkit-appearance:none;width:12px;height:12px;border-radius:50%;
-  background:#fff;box-shadow:0 0 6px rgba(0,0,0,.5);cursor:pointer;
-  transition:transform .12s}
+  background:#fff;box-shadow:0 0 6px rgba(0,0,0,.5);cursor:pointer;transition:transform .12s}
 .rbp-seek:hover::-webkit-slider-thumb{transform:scale(1.18)}
 .rbp-seek::-moz-range-thumb{width:12px;height:12px;border:0;border-radius:50%;background:#fff}
 .rbp-rate{flex:0 0 auto;background:transparent;border:1px solid rgba(255,255,255,.28);
   color:#eceff5;border-radius:7px;padding:4px 6px;font-size:12px;cursor:pointer;outline:none}
 .rbp-rate:hover{background:rgba(255,255,255,.14)}
 .rbp-rate option{background:#181c26;color:#eceff5}
-.rbp-close{opacity:.62}
-.rbp-close:hover{opacity:1}
 @media (max-width:520px){
   .rbp-inner{gap:7px;font-size:11.5px}
   .rbp-btn{width:28px;height:28px}
@@ -64,6 +63,64 @@
   .rbp-time{min-width:38px}
 }
 `;
+
+  // ======================================================================
+  // 配置读写：扩展环境走 chrome.storage.local，本地页由 shim 垫成 localStorage
+  // ======================================================================
+  function storageGet() {
+    return new Promise((resolve) => {
+      try {
+        if (typeof chrome !== "undefined" && chrome.storage && chrome.storage.local) {
+          chrome.storage.local.get({ [STORE_KEY]: {} }, (res) => {
+            const v = res && res[STORE_KEY];
+            resolve(v && typeof v === "object" ? v : {});
+          });
+          return;
+        }
+      } catch (_) {}
+      try {
+        const raw = localStorage.getItem(STORE_KEY);
+        resolve(raw ? JSON.parse(raw) || {} : {});
+      } catch (_) {
+        resolve({});
+      }
+    });
+  }
+
+  function storageSet(map) {
+    return new Promise((resolve) => {
+      try {
+        if (typeof chrome !== "undefined" && chrome.storage && chrome.storage.local) {
+          chrome.storage.local.set({ [STORE_KEY]: map }, () => resolve());
+          return;
+        }
+      } catch (_) {}
+      try {
+        localStorage.setItem(STORE_KEY, JSON.stringify(map));
+      } catch (_) {}
+      resolve();
+    });
+  }
+
+  let hostMap = {};
+  let hostKey = "";
+  let enabled = false;
+  let observersOn = false;
+
+  function currentHost() {
+    try {
+      return (location.hostname || "").toLowerCase();
+    } catch (_) {
+      return "";
+    }
+  }
+
+  function resolveEnabled() {
+    if (hostKey && Object.prototype.hasOwnProperty.call(hostMap, hostKey)) {
+      return !!hostMap[hostKey];
+    }
+    return DEFAULT_ON.test(hostKey || "");
+  }
 
   function injectStyle() {
     if (document.getElementById("rbp-style")) return;
@@ -73,7 +130,7 @@
     (document.head || document.documentElement).appendChild(s);
   }
 
-  const mounted = new WeakMap();
+  const mounted = new Map(); // video -> api（普通 Map，便于整体关闭时遍历）
 
   function fmtTime(sec) {
     const s = Number(sec);
@@ -87,8 +144,7 @@
       : `${m}:${String(ss).padStart(2, "0")}`;
   }
 
-  /** 把原站自己的控制条藏起来，避免两层叠在一起。
-   *  只动「明确是控制条」的元素，播放器外壳与点击层保留，免得破坏原站交互。 */
+  /** 只隐藏「明确是控制条」的元素，播放器外壳与点击层保留，免得破坏原站交互 */
   const NATIVE_BARS = [
     ".plyr__controls",
     ".fp-controls",
@@ -122,6 +178,19 @@
     }
   }
 
+  function restoreNativeControls(scope) {
+    const root = scope || document;
+    try {
+      root.querySelectorAll("[data-rbpHidden]").forEach((n) => {
+        n.style.removeProperty("display");
+        delete n.dataset.rbpHidden;
+      });
+    } catch (_) {}
+  }
+
+  // ======================================================================
+  // 挂载 / 卸载
+  // ======================================================================
   function attach(video, opts) {
     if (!video || video.tagName !== "VIDEO") return null;
     if (mounted.has(video)) return mounted.get(video);
@@ -130,11 +199,11 @@
     const options = opts || {};
     const hideNative = options.hideNative !== false;
 
-    // 需要一个定位容器：优先用「紧邻 video 的父元素」
     let container = video.parentElement;
     if (!container) return null;
     const cs = getComputedStyle(container);
     if (cs.position === "static") container.style.position = "relative";
+    container.dataset.rbpContainer = "1";
 
     if (hideNative) hideNativeControls(container);
 
@@ -157,11 +226,6 @@
           <option value="2">2x</option>
         </select>
         <button class="rbp-btn" data-act="full" title="全屏 (F)">${ICON.full}</button>
-        ${
-          options.closable
-            ? '<button class="rbp-btn rbp-close" data-act="close" title="收起控制条">✕</button>'
-            : ""
-        }
       </div>`;
     container.appendChild(root);
 
@@ -180,8 +244,7 @@
       root.setAttribute("data-hidden", "0");
       if (hideTimer) clearTimeout(hideTimer);
       hideTimer = setTimeout(() => {
-        if (video.paused) return;
-        if (scrubbing) return;
+        if (video.paused || scrubbing) return;
         root.setAttribute("data-hidden", "1");
       }, 2600);
     }
@@ -197,17 +260,17 @@
     }
     function syncSeek() {
       const d = video.duration;
-      if (scrubbing) return;
-      if (Number.isFinite(d) && d > 0) {
-        const p = (video.currentTime / d) * 1000;
-        seek.value = String(Math.round(p));
-        seek.style.backgroundSize = `${(p / 10).toFixed(2)}% 100%`;
+      if (!scrubbing) {
+        if (Number.isFinite(d) && d > 0) {
+          const p = (video.currentTime / d) * 1000;
+          seek.value = String(Math.round(p));
+          seek.style.backgroundSize = `${(p / 10).toFixed(2)}% 100%`;
+        }
+        curEl.textContent = fmtTime(video.currentTime);
+        durEl.textContent = fmtTime(d);
       }
-      curEl.textContent = fmtTime(video.currentTime);
-      durEl.textContent = fmtTime(d);
     }
 
-    // -- 事件 ---------------------------------------------------------------
     const bound = [];
     const on = (target, type, fn, o) => {
       target.addEventListener(type, fn, o);
@@ -227,13 +290,13 @@
     });
 
     on(btnFull, "click", () => {
-      const stage = container;
+      // 不能对 <video> 全屏：engine 在 fullscreenElement === video 时会 hideCanvas，
+      // 美颜直接消失。请求容器全屏可以保住 canvas。
       if (document.fullscreenElement) {
         document.exitFullscreen().catch(() => {});
-      } else if (stage.requestFullscreen) {
-        // 注意：不能对 <video> 全屏，否则美颜 canvas 会被浏览器踢出（engine 会回退原生）
-        stage.requestFullscreen().catch(() => {
-          video.requestFullscreen && video.requestFullscreen().catch(() => {});
+      } else if (container.requestFullscreen) {
+        container.requestFullscreen().catch(() => {
+          if (video.requestFullscreen) video.requestFullscreen().catch(() => {});
         });
       }
     });
@@ -282,10 +345,6 @@
       if (!video.paused) root.setAttribute("data-hidden", "1");
     });
 
-    if (options.closable) {
-      on(root.querySelector('[data-act="close"]'), "click", () => detach(video));
-    }
-
     syncPlayIcon();
     syncMuteIcon();
     syncSeek();
@@ -293,7 +352,6 @@
 
     const api = {
       root,
-      detach: () => detach(video),
       poke,
       unbind: () => {
         for (const [target, type, fn, o] of bound) {
@@ -302,13 +360,14 @@
           } catch (_) {}
         }
         bound.length = 0;
+        if (hideTimer) clearTimeout(hideTimer);
       },
     };
     mounted.set(video, api);
     return api;
   }
 
-  function detach(video) {
+  function detach(video, restore) {
     const api = mounted.get(video);
     if (!api) return;
     try {
@@ -317,21 +376,27 @@
     try {
       api.root.remove();
     } catch (_) {}
+    if (restore) restoreNativeControls(video.parentElement);
     mounted.delete(video);
   }
 
-  // -- 自动挂载：找「面积最大的那个 video」当主播放器 --------------------
+  function detachAll(restore) {
+    for (const v of Array.from(mounted.keys())) detach(v, restore);
+  }
+
+  // ======================================================================
+  // 自动挂载：找「面积最大的那个 video」当主播放器
+  // ======================================================================
   function pickMainVideo() {
     let best = null;
     let bestArea = 0;
     document.querySelectorAll("video").forEach((v) => {
+      if (mounted.has(v)) return;
       let area = 0;
       try {
         const r = v.getBoundingClientRect();
         area = r.width * r.height;
       } catch (_) {}
-      // 已经挂过的不重复处理
-      if (mounted.has(v)) return;
       if (area > bestArea && area > 40000) {
         bestArea = area;
         best = v;
@@ -341,39 +406,117 @@
   }
 
   function autoMount() {
+    if (!enabled) return;
     const v = pickMainVideo();
     if (v) attach(v, { hideNative: true });
   }
 
-  window.RBPlayerBar = { attach, detach, autoMount, pickMainVideo };
-
-  // 只在目标站点自动挂载（本地页由页面自己调 attach）
-  try {
-    if (!ALLOW_HOST.test(location.hostname)) return;
-  } catch (_) {
-    return;
+  // ======================================================================
+  // 开关
+  // ======================================================================
+  async function setEnabled(next) {
+    hostKey = hostKey || currentHost();
+    hostMap[hostKey] = !!next;
+    await storageSet(hostMap);
+    enabled = !!next;
+    if (enabled) {
+      ensureWatchers();
+      autoMount();
+    } else {
+      detachAll(true);
+    }
+    return enabled;
   }
 
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", autoMount, { once: true });
-  } else {
-    autoMount();
+  async function refresh() {
+    hostMap = await storageGet();
+    const next = resolveEnabled();
+    if (next !== enabled) {
+      enabled = next;
+      if (enabled) {
+        ensureWatchers();
+        autoMount();
+      } else {
+        detachAll(true);
+      }
+    }
+    return enabled;
   }
 
-  // 换集 / 换视频 / 懒渲染播放器：持续观察
-  let debounce = null;
-  const mo = new MutationObserver(() => {
-    if (debounce) clearTimeout(debounce);
-    debounce = setTimeout(autoMount, 350);
-  });
-  try {
-    mo.observe(document.documentElement || document.body, { childList: true, subtree: true });
-  } catch (_) {}
+  let watchersReady = false;
+  function ensureWatchers() {
+    if (watchersReady) return;
+    watchersReady = true;
 
-  // 原站播放器可能在我们挂载之后才重新渲染控制条，定期再压一次
-  setInterval(() => {
-    const v = pickMainVideo();
-    if (v) attach(v, { hideNative: true });
-    else if (document.querySelector("video")) hideNativeControls();
-  }, 2500);
+    let debounce = null;
+    try {
+      const mo = new MutationObserver(() => {
+        if (debounce) clearTimeout(debounce);
+        debounce = setTimeout(autoMount, 350);
+      });
+      mo.observe(document.documentElement || document.body, { childList: true, subtree: true });
+    } catch (_) {}
+
+    // 换集 / 懒渲染播放器：定期补挂；顺手清掉已脱离文档的旧节点
+    setInterval(() => {
+      if (!enabled) return;
+      for (const v of Array.from(mounted.keys())) {
+        if (!v.isConnected) detach(v, false);
+      }
+      if (pickMainVideo()) autoMount();
+      else if (document.querySelector("video")) hideNativeControls();
+    }, 2500);
+
+    // 其它标签页/面板改了配置，这边同步（shim 没有 onChanged，会静默跳过）
+    try {
+      if (typeof chrome !== "undefined" && chrome.storage && chrome.storage.onChanged) {
+        chrome.storage.onChanged.addListener((changes, area) => {
+          if (area !== "local" || !changes[STORE_KEY]) return;
+          const v = changes[STORE_KEY].newValue;
+          hostMap = v && typeof v === "object" ? v : {};
+          const next = resolveEnabled();
+          if (next === enabled) return;
+          enabled = next;
+          if (enabled) {
+            ensureWatchers();
+            autoMount();
+          } else {
+            detachAll(true);
+          }
+        });
+      }
+    } catch (_) {}
+  }
+
+  window.RBPlayerBar = {
+    attach,
+    detach,
+    autoMount,
+    pickMainVideo,
+    setEnabled,
+    refresh,
+    isEnabled: () => enabled,
+    getHost: () => hostKey || currentHost(),
+    /** 三个目标站默认开，其它站默认关 —— 供面板显示「默认/自定义」 */
+    isDefaultOn: () => DEFAULT_ON.test(hostKey || currentHost()),
+    ready: null,
+  };
+
+  // ---------------------------------------------------------------------
+  // 启动
+  // ---------------------------------------------------------------------
+  hostKey = currentHost();
+  const bootPromise = (async () => {
+    hostMap = await storageGet();
+    enabled = resolveEnabled();
+    if (!enabled) return false;
+    ensureWatchers();
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", autoMount, { once: true });
+    } else {
+      autoMount();
+    }
+    return true;
+  })();
+  window.RBPlayerBar.ready = bootPromise;
 })();

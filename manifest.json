@@ -92,14 +92,8 @@
     },
     {
       "matches": [
-        "https://*.missav.ws/*",
-        "https://missav.ws/*",
-        "https://*.missav.com/*",
-        "https://missav.com/*",
-        "https://*.javrate.com/*",
-        "https://javrate.com/*",
-        "https://*.avbebe.com/*",
-        "https://avbebe.com/*"
+        "http://*/*",
+        "https://*/*"
       ],
       "js": [
         "content/player-bar.js"
