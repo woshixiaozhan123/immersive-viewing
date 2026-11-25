@@ -55,6 +55,7 @@ const CORE_FILES = [
 const MODEL_FILES = [
   "vendor/mediapipe/vision_bundle.mjs",
   "vendor/mediapipe/face_landmarker.task",
+  "vendor/mediapipe/hair_segmenter.tflite",
   "vendor/mediapipe/wasm/vision_wasm_module_internal.js",
   "vendor/mediapipe/wasm/vision_wasm_module_internal.wasm",
 ];

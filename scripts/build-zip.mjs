@@ -31,19 +31,43 @@ const INCLUDE_PATHS = [
   "content",
   "worker",
   "test-page",
+  "cache-server",
   "vendor/mediapipe/vision_bundle.mjs",
   "vendor/mediapipe/face_landmarker.task",
+  "vendor/mediapipe/hair_segmenter.tflite",
   "vendor/mediapipe/wasm/vision_wasm_module_internal.js",
   "vendor/mediapipe/wasm/vision_wasm_module_internal.wasm",
 ];
+
+const EXCLUDE_DIRS = new Set([".venv", "runtime", "__pycache__"]);
+const EXCLUDE_FILES = new Set([
+  ".gitkeep",
+  ".DS_Store",
+  "Thumbs.db",
+  "env.json",
+  "profile-cache.json",
+  "launch.lock",
+  "com.realtime_beauty.cache_host.json",
+]);
+
+function shouldSkip(entryName, isDir) {
+  if (isDir) return EXCLUDE_DIRS.has(entryName);
+  if (EXCLUDE_FILES.has(entryName)) return true;
+  if (entryName.endsWith(".pyc") || entryName.endsWith(".log") || entryName.endsWith(".tmp") || entryName.endsWith(".part")) {
+    return true;
+  }
+  return false;
+}
 
 function copyRecursive(src, dst) {
   const st = fs.statSync(src);
   if (st.isDirectory()) {
     fs.mkdirSync(dst, { recursive: true });
     for (const entry of fs.readdirSync(src)) {
-      if (entry === ".gitkeep" || entry === ".DS_Store" || entry === "Thumbs.db") continue;
-      copyRecursive(path.join(src, entry), path.join(dst, entry));
+      const child = path.join(src, entry);
+      const childSt = fs.statSync(child);
+      if (shouldSkip(entry, childSt.isDirectory())) continue;
+      copyRecursive(child, path.join(dst, entry));
     }
   } else {
     fs.mkdirSync(path.dirname(dst), { recursive: true });
