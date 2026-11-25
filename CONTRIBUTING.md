@@ -1,4 +1,4 @@
-# 参与贡献 · 实时美颜
+# 参与贡献 · 沉浸式观影（Immersive Viewing）
 
 欢迎提交 Issue 和 Pull Request！
 
@@ -14,7 +14,12 @@
    ```bash
    npm run check
    ```
-5. 打包发布 zip：
+5. 若修改了 `cache-server/` 或 `native-host/` 脚本，请同步检查服务端与安装脚本：
+   ```powershell
+   .\cache-server\.venv\Scripts\python.exe -m py_compile cache-server\*.py cache-server\native-host\host.py
+   powershell -ExecutionPolicy Bypass -File cache-server\native-host\setup-local.ps1 -DryRun
+   ```
+6. 打包发布 zip：
    ```bash
    npm run build
    ```
