@@ -14,6 +14,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
+import config
 import subtitle_inference as inference
 import subtitle_profiles as profiles
 import webui
@@ -105,23 +106,80 @@ class Journal:
         return [cue["src"] for cue in self.source[previous]["cues"][-2:]]
 
 
+def _scan_audio_segs(entry: Path) -> list[int]:
+    asegs = entry / "asegs"
+    if not asegs.is_dir():
+        return []
+    indices: list[int] = []
+    for item in asegs.iterdir():
+        if item.suffix != ".seg" or not item.stem.isdigit():
+            continue
+        try:
+            if item.stat().st_size > config.HLS_SEGMENT_MIN_BYTES:
+                indices.append(int(item.stem))
+        except OSError:
+            continue
+    indices.sort()
+    return indices
+
+
+def _parse_m3u8_durations(path: Path) -> list[float]:
+    if not path.is_file():
+        return []
+    durations: list[float] = []
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            s = line.strip()
+            if s.startswith("#EXTINF:"):
+                try:
+                    durations.append(float(s[len("#EXTINF:") :].split(",")[0]))
+                except ValueError:
+                    durations.append(0.0)
+    except OSError:
+        return []
+    return durations
+
+
 @dataclass
 class Snapshot:
     starts: list[float]
     cached: set[int]
+    audio_track: bool = False
+    init_map: Path | None = None
 
     @classmethod
     def read(cls, cache, key: str):
         entry = cache.entry_dir(key)
-        indices, _ = webui._scan_segs(entry)
-        durations = webui._snapshot_durations(entry)
-        count = max(len(cache.read_segments(key)), len(durations), max(indices, default=-1) + 1)
-        fallback = float(cache.read_meta(key).get("segmentDuration") or 5)
+        meta = cache.read_meta(key)
+        has_audio_manifest = (entry / "a" / "0.m3u8").is_file() or (entry / "audio_segments.txt").is_file()
+        if has_audio_manifest:
+            indices = _scan_audio_segs(entry)
+            durations = _parse_m3u8_durations(entry / "a" / "0.m3u8")
+            seg_urls = cache.read_audio_segments(key)
+            count = max(len(seg_urls), len(durations), max(indices, default=-1) + 1)
+            init_url = entry / "a" / "init.url"
+            init_mp4 = entry / "a" / "init.mp4"
+            if init_url.is_file() and not init_mp4.is_file():
+                indices = []
+            init_map = init_mp4 if init_mp4.is_file() else None
+            audio_track = True
+        else:
+            indices, _ = webui._scan_segs(entry)
+            durations = webui._snapshot_durations(entry)
+            count = max(len(cache.read_segments(key)), len(durations), max(indices, default=-1) + 1)
+            init_url = entry / "v" / "init.url"
+            init_mp4 = entry / "v" / "init.mp4"
+            if init_url.is_file() and not init_mp4.is_file():
+                indices = []
+            init_map = init_mp4 if init_mp4.is_file() else None
+            audio_track = False
+
+        fallback = float(meta.get("segmentDuration") or 5)
         if not math.isfinite(fallback) or fallback <= 0:
             fallback = 5
         parts = (durations[i] if i < len(durations) and math.isfinite(durations[i]) and durations[i] > 0
                  else fallback for i in range(count))
-        return cls(list(itertools.accumulate(parts, initial=0.0)), set(indices))
+        return cls(list(itertools.accumulate(parts, initial=0.0)), set(indices), audio_track, init_map)
 
     def index(self, position: float) -> int:
         return bisect_right(self.starts, position) - 1
@@ -149,19 +207,35 @@ class Focus:
     profile: str
 
 
-def source_block(cache, work: Work, cancel=None) -> dict:
+def source_block(
+    cache,
+    work: Work,
+    cancel=None,
+    *,
+    threads: int | None = None,
+    beam_size: int = 2,
+    keep_warm: bool = False,
+) -> dict:
     snap = work.snapshot
     start, end = work.start, work.end
     left = start - 1 if start - 1 in snap.cached else start
     right = end + 1 if end + 1 in snap.cached else end
-    pcm = inference.extract_pcm([cache.seg_path(work.key, idx) for idx in range(left, right + 1)])
+    seg_fn = cache.audio_seg_path if snap.audio_track else cache.seg_path
+    pcm = inference.extract_pcm([seg_fn(work.key, idx) for idx in range(left, right + 1)], init_map=snap.init_map)
     lower, upper = snap.starts[start], snap.starts[end + 1]
     head = max(0, round((lower - OVERLAP - snap.starts[left]) * BYTES_PER_SECOND / 2) * 2)
     tail = round((upper + OVERLAP - snap.starts[left]) * BYTES_PER_SECOND / 2) * 2
     pcm = pcm[head:tail]
     offset = snap.starts[left] + head / BYTES_PER_SECOND
     actual_end = min(snap.starts[right + 1], offset + len(pcm) / BYTES_PER_SECOND)
-    detected = inference.run_whisper(pcm, None, cancel)
+    detected = inference.run_whisper(
+        pcm,
+        None,
+        cancel,
+        threads=threads,
+        beam_size=beam_size,
+        keep_warm=keep_warm,
+    )
     cues = []
     for cue in detected["cues"]:
         t0, t1 = max(offset, offset + cue["t0"]), min(actual_end, offset + cue["t1"])
@@ -204,9 +278,16 @@ class SubtitleService:
             if self.probe_cancel:
                 self.probe_cancel.set()
             self.condition.notify_all()
+        self.profiles.close()
         inference.stop_children()
         if self.worker:
             self.worker.join(timeout=5)
+
+    def is_busy(self) -> bool:
+        with self.condition:
+            now = time.monotonic()
+            self.focuses = {key: v for key, v in self.focuses.items() if now - v.last_seen <= TTL}
+            return bool(self.running is not None or self.probe_cancel is not None or self.focuses)
 
     def _entry(self, key: str):
         entry = self.cache.entry_dir(key)
@@ -327,21 +408,24 @@ class SubtitleService:
             if not cancel.is_set():
                 with self.condition:
                     self.profiles.timings[name] = seconds
+                    self.profiles.save_cache()
         except inference.InferenceCancelled:
             pass
         except (OSError, RuntimeError, ValueError):
             if not cancel.is_set():
                 with self.condition:
                     self.profiles.failed.add(name)
+                    self.profiles.save_cache()
         finally:
             with self.condition:
                 self.probe_cancel = None
 
     def _worker(self) -> None:
-        detected = profiles.discover()
+        detected, tier = profiles.discover()
         with self.condition:
-            self.profiles.profiles = detected
+            self.profiles.apply_discovered(detected, tier)
         while True:
+            self.profiles.maintain_warm_pool()
             with self.condition:
                 if self.closed:
                     return
@@ -367,9 +451,19 @@ class SubtitleService:
                 self._probe(candidate, cancel)
                 continue
             phase = work.phase
+            policy = self.profiles.runtime_policy()
             try:
                 if phase == "src":
-                    block = source_block(self.cache, work, cancel=cancel)
+                    if not policy["allow_dual_warm"]:
+                        self.profiles.pool.close()
+                    block = source_block(
+                        self.cache,
+                        work,
+                        cancel=cancel,
+                        threads=policy["whisper_threads"],
+                        beam_size=policy["beam_size"],
+                        keep_warm=policy["keep_warm"],
+                    )
                     if not self._commit(work, "src", block):
                         continue
                 phase = "zh"
@@ -377,6 +471,8 @@ class SubtitleService:
                 zh = {}
                 if cues:
                     inference.check_cancelled(cancel)
+                    if not policy["allow_dual_warm"]:
+                        inference.WHISPER_POOL.close()
                     zh = self.profiles.translate(work.profile, cues, prior, cancel)
                 committed = self._commit(work, "zh", {"start": work.start, "end": work.end, "zh": zh})
                 if committed and zh:

@@ -36,6 +36,10 @@ def close() -> None:
         service.close()
 
 
+def is_busy() -> bool:
+    return bool(service and service.is_busy())
+
+
 class FocusRequest(BaseModel):
     session: str = Field(min_length=1, max_length=90, pattern=r"^[\w-]+$")
     time: float = Field(ge=0, le=864000, allow_inf_nan=False)
