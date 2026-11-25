@@ -84,7 +84,8 @@
         "https://*/*"
       ],
       "js": [
-        "content/player-bar.js"
+        "content/player-bar.js",
+        "content/subtitles.js"
       ],
       "run_at": "document_idle",
       "all_frames": true,

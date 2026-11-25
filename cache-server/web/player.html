@@ -39,6 +39,7 @@
 <script src="/static/vendor/hls.min.js"></script>
 <script src="/static/shim.js"></script>
 <script src="/static/player-bar.js"></script>
+<script src="/static/subtitles.js"></script>
 <script src="/static/engine.js"></script>
 <script src="/static/overlay-ui.js"></script>
 
@@ -49,6 +50,7 @@
   window.__RB_LOCAL_KEY__ = KEY;
   const qs = new URLSearchParams(location.search);
   const MODE = qs.get("mode") === "all" ? "all" : "cached";
+  window.__RB_SUBS_TIMELINE_READY__ = false;
 
   const video = document.getElementById("player");
   const splash = document.getElementById("splash");
@@ -270,6 +272,7 @@
     paintTrace();
     updateBadge();
     window.__RB_FULL_TIME_MAP__ = buildTimeMap(info.ranges, info.durations, info.segmentDuration, MODE);
+    window.__RB_SUBS_TIMELINE_READY__ = true;
 
     if (MODE === "all") {
       const n = document.createElement("div");

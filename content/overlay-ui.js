@@ -797,6 +797,23 @@
               <span class="slider"></span>
             </label>
           </div>
+          <div class="row-between" style="margin-top:9px">
+            <label class="label" for="subtitleMode">本地字幕</label>
+            <select id="subtitleMode" class="select" style="width:auto;margin:0" disabled>
+              <option value="off">关闭</option>
+              <option value="zh">中文字幕</option>
+              <option value="both">双语字幕</option>
+            </select>
+          </div>
+          <div class="row-between" style="margin-top:9px">
+            <label class="label" for="subtitleProfile">字幕性能 <span id="subtitleProfileHint" class="hint-muted"></span></label>
+            <select id="subtitleProfile" class="select" style="width:auto;margin:0" disabled>
+              <option value="auto">自动</option>
+              <option value="cpu">CPU 兼容</option>
+              <option value="cpu-fast">CPU 多核</option>
+              <option value="gpu">GPU 翻译</option>
+            </select>
+          </div>
           <div class="row-between" id="cacheToggleRow" style="margin-top:9px">
             <span class="label">本站缓存 <span id="cacheHostHint" class="hint-muted"></span></span>
             <label class="switch" title="把本站视频分片缓存到本地磁盘（按域名记忆）。关闭=完全不接管">
@@ -1382,6 +1399,32 @@
         }
       }, 500);
     })();
+
+    const subtitleMode = $("subtitleMode");
+    if (window.RBSubtitles && subtitleMode) {
+      const subtitles = window.RBSubtitles;
+      const profileControl = $("subtitleProfile");
+      const profileHint = $("subtitleProfileHint");
+      const names = { cpu: "CPU 兼容", "cpu-fast": "CPU 多核", gpu: "GPU 翻译" };
+      const syncSubtitles = () => {
+        subtitleMode.value = subtitles.mode();
+        profileControl.value = subtitles.profile();
+        const active = subtitles.activeProfile();
+        for (const option of profileControl.options) {
+          if (!active || option.value === "auto" || option.value === "cpu") option.disabled = false;
+          else option.disabled = !active.available.includes(option.value);
+        }
+        profileHint.textContent = active ? names[active.effective] || "" : "";
+      };
+      subtitleMode.disabled = false;
+      profileControl.disabled = false;
+      profileControl.addEventListener("change", () => subtitles.setProfile(profileControl.value));
+      syncSubtitles();
+      subtitles.subscribe(syncSubtitles);
+      subtitleMode.addEventListener("change", () => {
+        void subtitles.setMode(subtitleMode.value);
+      });
+    }
 
     // 本站缓存开关 —— 按域名记忆，默认关；开了才会把分片落到磁盘
     (function setupCacheToggle() {

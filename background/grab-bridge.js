@@ -92,6 +92,34 @@ setInterval(() => {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || typeof msg.type !== "string") return;
 
+  if (msg.type === "rb-subs-context" || msg.type === "rb-subs-focus") {
+    const topUrl = sender?.tab?.url || "";
+    const pageKey = computeRbPageKey(topUrl);
+    if (!pageKey) {
+      sendResponse({ state: "uncached" });
+      return;
+    }
+    if (msg.type === "rb-subs-context") {
+      sendResponse({ host: new URL(topUrl).hostname.toLowerCase() });
+      return;
+    }
+    const key = pageKey.replace(/[^\w.\-]/g, "_").replace(/^[._]+|[._]+$/g, "");
+    const payload = msg.payload || {};
+    const clientSession = String(payload.session || "");
+    if (!/^[\w-]{1,60}$/.test(clientSession)) {
+      sendResponse({ key, state: "error" });
+      return;
+    }
+    const body = { ...payload, session: sender.tab.id + "-" + sender.frameId + "-" + clientSession };
+    fetch(RB_GRAB_LOCAL + "/api/subs/" + encodeURIComponent(key) + "/focus", {
+      method: "POST", cache: "no-store", signal: AbortSignal.timeout(4000),
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    }).then(async (response) => response.ok ? response.json()
+      : { key, state: response.status === 404 ? "uncached" : "offline" })
+      .then(sendResponse, () => sendResponse({ key, state: "offline" }));
+    return true;
+  }
+
   // 1) Frame initialization: return authoritative top-level pageUrl + pageKey + service liveness
   if (msg.type === "rb-grab-init") {
     const topUrl = (sender && sender.tab && sender.tab.url) || (msg.payload && msg.payload.pageUrl) || "";

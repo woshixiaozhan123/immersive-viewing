@@ -387,11 +387,11 @@
   // ======================================================================
   // 自动挂载：找「面积最大的那个 video」当主播放器
   // ======================================================================
-  function pickMainVideo() {
+  function pickMainVideo(includeMounted = false) {
     let best = null;
     let bestArea = 0;
     document.querySelectorAll("video").forEach((v) => {
-      if (mounted.has(v)) return;
+      if (!includeMounted && mounted.has(v)) return;
       let area = 0;
       try {
         const r = v.getBoundingClientRect();

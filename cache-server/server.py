@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import config
 import prescan
 import prescan_api
+import subtitle_api
 import webui
 from hls_proxy import TransparentHlsCache, b64d, safe_key_of
 from maintenance import CacheSweeper
@@ -98,6 +99,7 @@ async def lifespan(_app: FastAPI):
         yield
     finally:
         logger.info("Shutting down cache server...")
+        subtitle_api.close()
         sweeper.stop()
         hls_cache.close()
         if downloader is not None:
@@ -128,6 +130,8 @@ app.include_router(webui.router)
 # 离线人脸关键点预扫 API 与二进制表下载
 prescan_api.bind(hls_cache)
 app.include_router(prescan_api.router)
+subtitle_api.bind(hls_cache)
+app.include_router(subtitle_api.router)
 
 
 @app.middleware("http")

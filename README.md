@@ -98,6 +98,28 @@ pip install -r requirements.txt
 python main.py          # 打开 http://127.0.0.1:8765/
 ```
 
+### 离线中文字幕（可选）
+
+在面板的「本地字幕」里选「中文字幕」或「双语字幕」。打开本站缓存后，字幕会优先处理播放头和前方已落盘的分片。拖动进度条后会调高新位置的优先级。已经生成的原文和译文保存在对应视频的缓存目录，重新播放时可直接复用。
+
+转写用 Whisper small，翻译用混元 Hy-MT2 1.8B Q4，默认都在 CPU 上运行。模型准备好后，字幕服务只读本机分片，在本机完成转写和翻译。
+
+在 `cache-server` 目录用现有 Python 环境安装可选依赖：
+
+```powershell
+python -m pip install -r requirements-subtitles.txt
+python -c "from huggingface_hub import snapshot_download; print(snapshot_download('Systran/faster-whisper-small'))"
+$env:RB_SUBS_LLAMA_BIN = "C:\tools\llama.cpp\llama-server.exe"
+$env:RB_SUBS_MT_MODEL = "C:\models\Hy-MT2-1.8B-Q4_K_M.gguf"
+python main.py
+```
+
+将两个路径换成本机文件位置。混元模型和运行程序可从 [混元模型主页](https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF) 和 [llama.cpp Releases](https://github.com/ggml-org/llama.cpp/releases) 获取。如果 Whisper 权重放在自定义目录，可设置 `RB_SUBS_WHISPER_DIR`。默认按可用逻辑核数分配最多 4 个 CPU 线程，可用 `RB_SUBS_THREADS` 调整。
+
+「字幕性能」默认选自动。服务先用 CPU 兼容档出字幕，再在没有待生成分片时用固定短句试跑可用翻译档位，计入模型启动耗时。可以手动选 CPU 兼容、CPU 多核或 GPU 翻译，实际使用的档位会显示在面板上。Whisper 始终在 CPU 转写。
+
+GPU 翻译需要支持 Vulkan 的 llama-server。可将该版本路径填入 `RB_SUBS_LLAMA_GPU_BIN`；已有的 CPU 版路径继续放在 `RB_SUBS_LLAMA_BIN`。显存余量不足、后端不可用或运行失败时，服务会使用 CPU 兼容档。同一段已生成字幕可跨档复用。
+
 ### 缓存默认是关的，按站点自己开
 
 不想要某个站的视频被存下来？默认就是关的。要缓存时，在美颜面板「当前视频」卡片里打开 **「本站缓存」** 开关即可 —— 按域名记忆，开启后正在播的视频会原地热切到本地代理，不用刷新。
