@@ -53,7 +53,7 @@ flowchart LR
 ## 快速安装（桌面端 Chromium 浏览器）
 
 ### 方式一：直接下载 Release 预构建包（推荐普通用户）
-1. 前往 [Releases 页面](https://github.com/woshixiaozhan123/immersive-viewing/releases) 下载 `immersive-viewing-v1.3.0.zip` 并解压（内含全部离线美颜模型与本地字幕/缓存服务脚本，无需安装 Git）。
+1. 前往 [Releases 页面](https://github.com/woshixiaozhan123/immersive-viewing/releases) 下载 `immersive-viewing-v1.3.1.zip` 并解压（内含全部离线美颜模型与本地字幕/缓存服务脚本，无需安装 Git）。
 2. 打开浏览器扩展管理页：
    - Chrome：`chrome://extensions`
    - Edge：`edge://extensions`
@@ -231,17 +231,19 @@ python ../scripts/check_landmarks.py ~/Videos/grab-cache/<safeKey>/landmarks.bin
 
 ## iOS Safari 安装与横屏全屏
 
-仓库内置与桌面端完全同步的 iOS Safari 用户脚本：[ios/realtime-beauty-ios.user.js](ios/realtime-beauty-ios.user.js)（同样具备全部 26 项参数、7 档预设、Wink 中文配方解析与可选 478 点追踪）。
+仓库内置与桌面端画质同步的 iOS Safari 用户脚本：[ios/realtime-beauty-ios.user.js](ios/realtime-beauty-ios.user.js)（具备全部 26 项参数、7 档预设、Wink 中文配方解析、可选 478 点人脸遮罩、发丝防糊保护与超清 1080p 渲染档位）。
 
-### 安装步骤（Userscripts / Stay）
+### 安装与更新步骤（Userscripts / Stay）
 1. 在 App Store 安装免费开源的 **Userscripts**（或 **Stay**），并在 iOS「设置 → Safari 浏览器 → 扩展」中开启并授予网站权限。
 2. 下载或直接从 Raw 链接安装脚本：
    `https://raw.githubusercontent.com/woshixiaozhan123/immersive-viewing/main/ios/realtime-beauty-ios.user.js`
-3. 若使用 **Userscripts**：将脚本保存到 iCloud Drive /「我的 iPhone」下的 Userscripts 目录，刷新 Safari 视频页即可在右下角看到悬浮球。
+3. 若使用 **Userscripts**：将脚本保存到 iCloud Drive /「我的 iPhone」下的 Userscripts 目录，刷新 Safari 视频页即可在右下角看到悬浮球（后续升级直接下载同名文件覆盖即可，已存配方不丢失）。
+4. 若使用 **Stay**：脚本已内置 `@updateURL` / `@downloadURL`，后续在 Stay 扩展里点击「检查更新」即可一键升级。
 
-### iOS 美颜剧场全屏 & 90° 横屏
+### iOS 美颜剧场全屏、90° 横屏 & 长按原画对比
 - iOS 原生视频全屏会由系统 `AVPlayer` 接管并遮挡网页叠层；点击悬浮球旁的 **`⛶ 全屏`**（或面板底部的 **`⛶ 美颜全屏`**）即可进入美颜剧场全屏，完整保留美颜、进度条拖拽、倍速和实时调参。
 - 即使手机开启了「竖排方向锁定」，点右上角 **`↻ 横屏90°`** 也能一键旋转横屏铺满观看。
+- 在剧场全屏下**长按视频画面**可临时对比原画，松手自动恢复美颜。
 
 ---
 

@@ -43,5 +43,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.zip
+          files: |
+            dist/*.zip
+            ios/realtime-beauty-ios.user.js
           generate_release_notes: true

@@ -1,8 +1,10 @@
 // ==UserScript==
-// @name         实时美颜 · iOS Safari 专业版
+// @name         沉浸式观影 · iOS Safari 专业版
 // @namespace    https://local.realtime-beauty.ios/
-// @version      1.1.0
-// @description  iOS Safari (Userscripts / Stay) 实时网页视频美颜：26 项 Wink/剪映专业分项调参、7 档预设（含减龄打底）、JSON 与 Wink 中文配方文本解析、美颜剧场全屏 + 一键 90° 横屏旋转、可选 478 点人脸遮罩。
+// @version      1.3.1
+// @description  iOS Safari (Userscripts / Stay) 沉浸式观影美颜：26 项 Wink/剪映专业分项调参、可选 478 点人脸遮罩与发丝防糊保护、超清 1080p 视网膜渲染档位、剧场全屏 + 90° 横屏 + 长按对比原画。
+// @updateURL    https://raw.githubusercontent.com/woshixiaozhan123/immersive-viewing/main/ios/realtime-beauty-ios.user.js
+// @downloadURL  https://raw.githubusercontent.com/woshixiaozhan123/immersive-viewing/main/ios/realtime-beauty-ios.user.js
 // @match        http://*/*
 // @match        https://*/*
 // @grant        none
@@ -63,11 +65,15 @@
   const STORAGE_KEY_PARAMS_LEGACY = "__wvb_ios_params_v1";
   const STORAGE_KEY_SAVED = "__wvb_ios_saved_v2";
   const STORAGE_KEY_FACE_OPT = "__wvb_ios_face_opt_v1";
+  const STORAGE_KEY_HAIR_OPT = "__wvb_ios_hair_opt_v1";
+  const STORAGE_KEY_HD_OPT = "__wvb_ios_hd_opt_v1";
 
   const MP_BUNDLE_URL = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.2.3/vision_bundle.mjs";
   const MP_WASM_DIR = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.2.3/wasm";
   const MP_MODEL_URL =
     "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+  const MP_HAIR_MODEL_URL =
+    "https://storage.googleapis.com/mediapipe-models/image_segmenter/hair_segmenter/float32/1/hair_segmenter.tflite";
 
   const IS_IOS_OR_MOBILE =
     /iPad|iPhone|iPod|Android|Mobile/i.test(navigator.userAgent) ||
@@ -552,6 +558,125 @@
     return { params: out, matched: matchedKeys.size, skipped };
   }
 
+  // ==================== Inline MediaPipe Hair Segmenter Worker (Independent ModuleFactory) ====================
+  const HAIR_WORKER_SOURCE = `
+    let segmenter = null;
+    let initialized = false;
+    let segFails = 0;
+    const MAX_SEG_FAILS = 3;
+
+    function warmupHair() {
+      try {
+        if (typeof OffscreenCanvas !== "function") return;
+        const c = new OffscreenCanvas(256, 256);
+        const ctx = c.getContext("2d");
+        if (!ctx) return;
+        ctx.fillStyle = "#808080";
+        ctx.fillRect(0, 0, 256, 256);
+        const bmp = c.transferToImageBitmap();
+        let r = null;
+        try {
+          r = segmenter.segment(bmp);
+        } finally {
+          try { bmp.close(); } catch (_) {}
+          try { if (r && typeof r.close === "function") r.close(); } catch (_) {}
+        }
+      } catch (_) {}
+    }
+
+    async function initHair(bundleUrl, wasmDir, modelUrl, preferredDelegate = "GPU") {
+      try {
+        if (segmenter && typeof segmenter.close === "function") {
+          try { segmenter.close(); } catch (_) {}
+          segmenter = null;
+        }
+        const mod = await import(bundleUrl);
+        const { FilesetResolver, ImageSegmenter } = mod;
+        if (!ImageSegmenter) throw new Error("ImageSegmenter unavailable");
+        const order = preferredDelegate === "CPU" ? ["CPU"] : ["GPU", "CPU"];
+        let lastErr = null;
+        for (const del of order) {
+          try {
+            const fileset = await FilesetResolver.forVisionTasks(wasmDir, true);
+            segmenter = await ImageSegmenter.createFromOptions(fileset, {
+              baseOptions: { modelAssetPath: modelUrl, delegate: del },
+              runningMode: "IMAGE",
+              outputCategoryMask: false,
+              outputConfidenceMasks: true,
+            });
+            initialized = true;
+            segFails = 0;
+            warmupHair();
+            self.postMessage({ type: "READY", delegate: del });
+            return;
+          } catch (e) {
+            lastErr = e;
+            if (del === "GPU" && preferredDelegate !== "CPU") {
+              self.postMessage({ type: "FALLBACK_CPU", reason: e && e.message ? e.message : String(e) });
+              return;
+            }
+          }
+        }
+        throw lastErr || new Error("hair segmenter init failed");
+      } catch (err) {
+        initialized = false;
+        self.postMessage({ type: "UNAVAILABLE", reason: ((err && err.message) || String(err)).slice(0, 180) });
+      }
+    }
+
+    self.onmessage = async (event) => {
+      const msg = event.data;
+      if (!msg) return;
+      if (msg.type === "INIT") {
+        await initHair(msg.bundleUrl, msg.wasmDir, msg.modelUrl, msg.delegate || "GPU");
+        return;
+      }
+      if (msg.type === "CLOSE") {
+        try { if (segmenter && typeof segmenter.close === "function") segmenter.close(); } catch (_) {}
+        segmenter = null;
+        initialized = false;
+        self.postMessage({ type: "CLOSED" });
+        return;
+      }
+      if (msg.type === "FRAME") {
+        const bitmap = msg.bitmap;
+        let result = null;
+        let maskRef = null;
+        try {
+          if (!initialized || !segmenter || !bitmap) return;
+          result = segmenter.segment(bitmap);
+          const masks = result && result.confidenceMasks;
+          if (!masks || !masks.length) return;
+          maskRef = masks[masks.length - 1];
+          if (!maskRef || typeof maskRef.getAsFloat32Array !== "function") return;
+          const f32 = maskRef.getAsFloat32Array();
+          const u8 = new Uint8Array(f32.length);
+          for (let i = 0; i < f32.length; i++) {
+            const v = f32[i] * 255;
+            u8[i] = v <= 0 ? 0 : v >= 255 ? 255 : v | 0;
+          }
+          segFails = 0;
+          self.postMessage(
+            { type: "HAIR", mask: u8, w: maskRef.width, h: maskRef.height, roi: msg.roi, seq: msg.seq },
+            [u8.buffer]
+          );
+        } catch (e) {
+          segFails += 1;
+          if (segFails >= MAX_SEG_FAILS) {
+            try { if (segmenter && typeof segmenter.close === "function") segmenter.close(); } catch (_) {}
+            segmenter = null;
+            initialized = false;
+            self.postMessage({ type: "UNAVAILABLE", reason: ((e && e.message) || String(e)).slice(0, 180) });
+          }
+        } finally {
+          try { if (maskRef && typeof maskRef.close === "function") maskRef.close(); } catch (_) {}
+          try { if (result && typeof result.close === "function") result.close(); } catch (_) {}
+          try { if (bitmap) bitmap.close(); } catch (_) {}
+        }
+      }
+    };
+  `;
+
   // ==================== Inline MediaPipe 478-Point Worker (Zero-Lag IMAGE + ROI Edition) ====================
   const FACE_WORKER_SOURCE = `
     let landmarker = null;
@@ -848,6 +973,7 @@
     precision mediump float;
     uniform sampler2D u_video;
     uniform sampler2D u_mask;
+    uniform sampler2D u_hair;
     uniform vec2 u_texel;
     uniform float u_hasFaceMask;
     uniform float u_compareOriginal;
@@ -861,6 +987,8 @@
     uniform vec4 u_colorA;    // (sharpen, exposure, contrast, saturation)
     uniform vec4 u_colorB;    // (temperature, softGlow, fade, liteMode)
     uniform vec4 u_maskRect;  // (rx, ry, invRw, invRh) tight face-ROI mask UV mapping
+    uniform vec4 u_hairRect;  // (rx, ry, invRw, invRh) hair confidence ROI mapping
+    uniform vec2 u_hairCtrl;  // (enabled 0/1, strength)
     uniform vec4 u_yawVis;    // (leftVis, rightVis, reshapeGate, mouthHalfW)
 
     uniform vec4 u_eyes;          // (leftEyeX, leftEyeY, rightEyeX, rightEyeY)
@@ -958,8 +1086,11 @@
         if (liteMode > 0.5 && i >= 6) break;
         vec2 sampleUv = clamp(uv + offsets[i] * u_texel * radiusScale, vec2(0.0), vec2(1.0));
         vec3 s = texture2D(u_video, sampleUv).rgb;
-        float diff = dot(s, vec3(0.299, 0.587, 0.114)) - centerLuma;
-        float w = exp(-(diff * diff) / (2.0 * sigmaRange * sigmaRange));
+        vec3 dRgb = s - center;
+        float diff = dot(dRgb, vec3(0.299, 0.587, 0.114));
+        float chromaDiff = length(dRgb - vec3(diff));
+        float dist2 = diff * diff + 0.18 * chromaDiff * chromaDiff;
+        float w = exp(-dist2 / (2.0 * sigmaRange * sigmaRange));
         float spatial = (i < 6) ? 1.0 : 0.72;
         acc += s * (w * spatial);
         wSum += w * spatial;
@@ -1107,6 +1238,10 @@
       float hairProtect = smoothstep(0.06, 0.22, origLuma);
       float skinGate = mix(0.22 * hairProtect, 1.0, clamp(skinW * 1.15, 0.0, 1.0));
       float skinArea = (u_hasFaceMask > 0.5) ? (faceSkinMask * skinGate) : (skinW * 0.85);
+      vec2 hairUv = (v_uv - u_hairRect.xy) * u_hairRect.zw;
+      float hairInside = step(0.0, hairUv.x) * step(hairUv.x, 1.0) * step(0.0, hairUv.y) * step(hairUv.y, 1.0);
+      float hairConf = texture2D(u_hair, clamp(hairUv, 0.0, 1.0)).r * hairInside * u_hairCtrl.x;
+      skinArea *= 1.0 - clamp(hairConf * u_hairCtrl.y, 0.0, 1.0);
 
       float ueW = 0.0;
       float nlW = 0.0;
@@ -1135,7 +1270,7 @@
         didSmooth = true;
         if (effSmooth > 0.001) {
           float blend = clamp(skinArea * (0.25 + effSmooth * 0.75) * min(effSmooth * 2.2, 1.0) * faceFade, 0.0, 0.94);
-          vec3 microTex = (orig.rgb - smoothed) * (skinTexAmt * 0.34);
+          vec3 microTex = clamp((orig.rgb - smoothed) * (skinTexAmt * 0.36), vec3(-0.075), vec3(0.075));
           rgb = mix(rgb, clamp(smoothed + microTex, 0.0, 1.0), blend);
         }
       }
@@ -1299,6 +1434,8 @@
       this.onChange = onChange || (() => {});
       this.enabled = false;
       this.faceTrackingEnabled = !!safeStorageGet(STORAGE_KEY_FACE_OPT, false);
+      this.hairProtectEnabled = !!safeStorageGet(STORAGE_KEY_HAIR_OPT, false);
+      this.hdRenderEnabled = !!safeStorageGet(STORAGE_KEY_HD_OPT, false);
       const saved = safeStorageGet(STORAGE_KEY_PARAMS, null) || safeStorageGet(STORAGE_KEY_PARAMS_LEGACY, null);
       this.params = saved ? normalizeParams(saved, DEFAULT_PARAMS).params : { ...DEFAULT_PARAMS };
       this.compareOriginal = false;
@@ -1353,6 +1490,14 @@
       this.maskCanvas.height = 256;
       this.maskCtx = this.maskCanvas.getContext("2d");
       this.maskRect = [0, 0, 1, 1];
+      this.hairTex = null;
+      this.hairReady = false;
+      this.hairRect = [0, 0, 1, 1];
+      this.hairAmt = 0.92;
+      this.hairCanvas = document.createElement("canvas");
+      this.hairCanvas.width = 256;
+      this.hairCanvas.height = 256;
+      this.hairCtx = this.hairCanvas.getContext("2d", { willReadFrequently: false });
 
       this.inferCanvas = document.createElement("canvas");
       this.inferCtx = this.inferCanvas.getContext("2d", { willReadFrequently: false });
@@ -1373,6 +1518,24 @@
       this.workerInitializing = false;
       this.workerUnavailable = false;
       this.lastInferSentMs = 0;
+
+      this.hairWorker = null;
+      this.hairBlobUrl = null;
+      this.hairWorkerReady = false;
+      this.hairWorkerBusy = false;
+      this.hairWorkerInitializing = false;
+      this.hairWorkerUnavailable = false;
+      this.hairDelegatePref = "GPU";
+      this.hairWorkerStatus = this.hairProtectEnabled ? "待启动" : "未启用";
+      this.hairWatchdog = 0;
+      this.hairSeq = 0;
+      this.hairTick = 0;
+      this.lastHairSentMs = 0;
+      this.hairSegMs = 0;
+      this.hairCoverage = 0;
+      this.HAIR_EVERY = 3;
+      this.facePxInfer = 0;
+
       this.latestLandmarks = null;
       this.latestLandmarkTs = 0;
       this.latestLandmarkRecvTs = 0;
@@ -2014,6 +2177,9 @@
       this.videoTex = this.createLinearTexture(gl);
       this.pendingTex = this.createLinearTexture(gl);
       this.maskTex = this.createLinearTexture(gl);
+      this.hairTex = this.createLinearTexture(gl);
+      gl.bindTexture(gl.TEXTURE_2D, this.hairTex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, 1, 1, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, new Uint8Array([0]));
       this.hasCommittedFrame = false;
       this.pendingFrameId = 0;
 
@@ -2022,6 +2188,7 @@
         u_uvTransform: u("u_uvTransform"),
         u_video: u("u_video"),
         u_mask: u("u_mask"),
+        u_hair: u("u_hair"),
         u_texel: u("u_texel"),
         u_hasFaceMask: u("u_hasFaceMask"),
         u_compareOriginal: u("u_compareOriginal"),
@@ -2034,6 +2201,8 @@
         u_colorA: u("u_colorA"),
         u_colorB: u("u_colorB"),
         u_maskRect: u("u_maskRect"),
+        u_hairRect: u("u_hairRect"),
+        u_hairCtrl: u("u_hairCtrl"),
         u_yawVis: u("u_yawVis"),
         u_eyes: u("u_eyes"),
         u_eyeOuter: u("u_eyeOuter"),
@@ -2047,8 +2216,11 @@
       };
       gl.uniform1i(this.uniforms.u_video, 0);
       gl.uniform1i(this.uniforms.u_mask, 1);
+      gl.uniform1i(this.uniforms.u_hair, 2);
       gl.uniform4f(this.uniforms.u_uvTransform, 1, 1, 0, 0);
       gl.uniform4f(this.uniforms.u_maskRect, 0, 0, 1, 1);
+      gl.uniform4f(this.uniforms.u_hairRect, 0, 0, 1, 1);
+      gl.uniform2f(this.uniforms.u_hairCtrl, 0, this.hairAmt);
       gl.uniform4f(this.uniforms.u_yawVis, 1, 1, 1, 0.05);
       return true;
     }
@@ -2080,12 +2252,14 @@
         if (this.videoTex) oldGl.deleteTexture(this.videoTex);
         if (this.pendingTex) oldGl.deleteTexture(this.pendingTex);
         if (this.maskTex) oldGl.deleteTexture(this.maskTex);
+        if (this.hairTex) oldGl.deleteTexture(this.hairTex);
         if (this.posBuf) oldGl.deleteBuffer(this.posBuf);
         if (this.program) oldGl.deleteProgram(this.program);
         const ext = oldGl.getExtension("WEBGL_lose_context");
         if (ext) ext.loseContext();
       }
-      this.program = null; this.videoTex = null; this.pendingTex = null; this.maskTex = null; this.posBuf = null;
+      this.program = null; this.videoTex = null; this.pendingTex = null; this.maskTex = null; this.hairTex = null; this.posBuf = null;
+      this.hairReady = false;
       this.hasCommittedFrame = false; this.pendingFrameId = 0;
       if (oldCanvas && oldCanvas.parentElement) oldCanvas.parentElement.removeChild(oldCanvas);
     }
@@ -2207,10 +2381,11 @@
         this.canvas.style.setProperty("width", `${dispW}px`, "important");
         this.canvas.style.setProperty("height", `${dispH}px`, "important");
 
-        const dpr = Math.min(window.devicePixelRatio || 1, IS_IOS_OR_MOBILE ? 1.5 : 1.75);
+        const hdActive = this.hdRenderEnabled && this.degradeTier !== "L2";
+        const dpr = Math.min(window.devicePixelRatio || 1, hdActive ? 2.0 : IS_IOS_OR_MOBILE ? 1.5 : 1.75);
         const isPortrait = dispH > dispW;
-        const longMax = this.degradeTier === "L2" ? 1280 : IS_IOS_OR_MOBILE ? 1440 : 1920;
-        const shortMax = this.degradeTier === "L2" ? 720 : IS_IOS_OR_MOBILE ? 810 : 1080;
+        const longMax = this.degradeTier === "L2" ? 1280 : hdActive ? 1920 : IS_IOS_OR_MOBILE ? 1440 : 1920;
+        const shortMax = this.degradeTier === "L2" ? 720 : hdActive ? 1080 : IS_IOS_OR_MOBILE ? 810 : 1080;
         const maxW = isPortrait ? shortMax : longMax;
         const maxH = isPortrait ? longMax : shortMax;
         const targetW = Math.max(2, Math.min(Math.round(dispW * dpr), this.video.videoWidth || maxW, maxW));
@@ -2285,11 +2460,12 @@
       this.canvas.style.setProperty("transform", canvasTransform, "important");
       this.lastGeomSig = `${Math.round(vRect.left * 2)},${Math.round(vRect.top * 2)},${Math.round(vRect.width * 2)},${Math.round(vRect.height * 2)},${Math.round(opRect.left * 2)},${Math.round(opRect.top * 2)},${this.video.videoWidth}x${this.video.videoHeight},${vStyle.objectFit},${vStyle.objectPosition},${vStyle.transform}`;
 
-      const dprCap = IS_IOS_OR_MOBILE ? 1.25 : 1.5;
+      const hdActive = this.hdRenderEnabled && this.degradeTier !== "L2";
+      const dprCap = hdActive ? 1.75 : IS_IOS_OR_MOBILE ? 1.25 : 1.5;
       const dpr = Math.min(win.devicePixelRatio || 1, dprCap);
       const isPortrait = cssH > cssW;
-      const longMax = this.degradeTier === "L2" || IS_IOS_OR_MOBILE ? 1280 : 1920;
-      const shortMax = this.degradeTier === "L2" || IS_IOS_OR_MOBILE ? 720 : 1080;
+      const longMax = this.degradeTier === "L2" ? 1280 : hdActive ? 1920 : IS_IOS_OR_MOBILE ? 1280 : 1920;
+      const shortMax = this.degradeTier === "L2" ? 720 : hdActive ? 1080 : IS_IOS_OR_MOBILE ? 720 : 1080;
       const maxW = isPortrait ? shortMax : longMax;
       const maxH = isPortrait ? longMax : shortMax;
 
@@ -2393,6 +2569,7 @@
             this.workerReady = true;
             this.workerInitializing = false;
             this.workerStatus = `就绪 (${msg.delegate} · 零滞后帧同步)`;
+            if (this.enabled && this.hairProtectEnabled) this.ensureHairWorker();
             if (this.enabled && this.captureStatus === "ready" && this.video) {
               this.maybeDispatchInference(performance.now(), true);
             }
@@ -2509,6 +2686,8 @@
       this.workerInitializing = false;
       this.workerReady = false;
       this.workerBusy = false;
+      this.hairReady = false;
+      this.terminateHairWorker(false, true);
       if (this.mainTracker) {
         this.mainTracker.close();
         this.mainTracker = null;
@@ -2535,6 +2714,158 @@
       oldW.onmessage = (e) => { if (e.data && e.data.type === "CLOSED") clean(); };
       oldW.onerror = clean;
       try { oldW.postMessage({ type: "CLOSE" }); } catch (_) { clean(); }
+    }
+
+    async ensureHairWorker(preferredDelegate = this.hairDelegatePref || "GPU") {
+      if (
+        !this.enabled ||
+        !this.faceTrackingEnabled ||
+        !this.hairProtectEnabled ||
+        this.destroyed ||
+        this.hairWorker ||
+        this.hairWorkerInitializing ||
+        this.hairWorkerUnavailable
+      ) {
+        return;
+      }
+      this.hairWorkerInitializing = true;
+      this.hairDelegatePref = preferredDelegate;
+      this.hairWorkerStatus = preferredDelegate === "CPU" ? "发丝模型加载中 (CPU)…" : "发丝模型加载中…";
+      try {
+        const blob = new Blob([HAIR_WORKER_SOURCE], { type: "application/javascript" });
+        this.hairBlobUrl = URL.createObjectURL(blob);
+        const w = new Worker(this.hairBlobUrl, { type: "module" });
+        this.hairWorker = w;
+        this.hairWorkerInitializing = false;
+
+        w.onmessage = (e) => {
+          const msg = e.data;
+          if (!msg || this.hairWorker !== w) return;
+          if (msg.type === "READY") {
+            this.hairWorkerReady = true;
+            this.hairWorkerStatus = `就绪 (${msg.delegate})`;
+            this.onChange();
+          } else if (msg.type === "FALLBACK_CPU") {
+            this.terminateHairWorker(true, true);
+            if (this.enabled && this.faceTrackingEnabled && this.hairProtectEnabled && !this.destroyed) {
+              this.ensureHairWorker("CPU");
+            }
+          } else if (msg.type === "UNAVAILABLE") {
+            this.hairWorkerReady = false;
+            this.hairWorkerUnavailable = true;
+            this.hairWorkerStatus = `不可用: ${String(msg.reason || "").slice(0, 42)}`;
+            this.terminateHairWorker(true, true);
+            this.onChange();
+          } else if (msg.type === "HAIR") {
+            this.hairSegMs = Math.round(this.hairSegMs * 0.7 + (performance.now() - this.lastHairSentMs) * 0.3);
+            this.updateHairMask(msg);
+            this.hairWorkerBusy = false;
+            clearTimeout(this.hairWatchdog);
+          }
+        };
+
+        w.onerror = () => {
+          if (this.hairWorker !== w) return;
+          this.hairWorkerReady = false;
+          this.hairWorkerUnavailable = true;
+          this.hairWorkerStatus = "受 CSP/Safari 限制";
+          this.terminateHairWorker(true, true);
+          this.onChange();
+        };
+
+        w.postMessage({
+          type: "INIT",
+          bundleUrl: MP_BUNDLE_URL,
+          wasmDir: MP_WASM_DIR,
+          modelUrl: MP_HAIR_MODEL_URL,
+          delegate: preferredDelegate,
+        });
+      } catch (_) {
+        this.hairWorkerInitializing = false;
+        this.hairWorkerReady = false;
+        this.hairWorkerUnavailable = true;
+        this.hairWorkerStatus = "启动受限";
+      }
+    }
+
+    dispatchHairFrame(roi) {
+      if (!this.hairWorker || !this.hairWorkerReady || this.hairWorkerBusy || !this.hairCtx) return;
+      const src = this.inferCanvas;
+      if (!src || !src.width || !src.height) return;
+      const seq = ++this.hairSeq;
+      this.hairWorkerBusy = true;
+      this.lastHairSentMs = performance.now();
+      clearTimeout(this.hairWatchdog);
+      this.hairWatchdog = setTimeout(() => {
+        if (!this.hairWorkerBusy) return;
+        this.hairWorkerBusy = false;
+        this.hairWorkerStatus = `${this.hairDelegatePref} · 响应超时`;
+      }, 6000);
+      try {
+        this.hairCtx.drawImage(src, 0, 0, 256, 256);
+        createImageBitmap(this.hairCanvas)
+          .then((bitmap) => {
+            if (!this.hairWorker || seq !== this.hairSeq) {
+              bitmap.close();
+              if (seq === this.hairSeq) this.hairWorkerBusy = false;
+              return;
+            }
+            this.hairWorker.postMessage({ type: "FRAME", bitmap, roi, seq }, [bitmap]);
+          })
+          .catch(() => {
+            this.hairWorkerBusy = false;
+          });
+      } catch (_) {
+        this.hairWorkerBusy = false;
+      }
+    }
+
+    updateHairMask(msg) {
+      const gl = this.gl;
+      if (!gl || !this.hairTex || !msg || !msg.mask || !msg.w || !msg.h) return;
+      try {
+        gl.activeTexture(gl.TEXTURE2);
+        gl.bindTexture(gl.TEXTURE_2D, this.hairTex);
+        gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, msg.w, msg.h, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, msg.mask);
+        const roi = msg.roi;
+        this.hairRect = roi && roi.w > 0 && roi.h > 0 ? [roi.x, roi.y, 1 / roi.w, 1 / roi.h] : [0, 0, 1, 1];
+        this.hairReady = true;
+        const m = msg.mask;
+        let hits = 0;
+        let n = 0;
+        for (let i = 0; i < m.length; i += 4) {
+          if (m[i] > 128) hits++;
+          n++;
+        }
+        this.hairCoverage = n ? hits / n : 0;
+      } catch (_) {
+        this.hairReady = false;
+      }
+    }
+
+    terminateHairWorker(preserveStatus = false, immediate = false) {
+      this.hairWorkerInitializing = false;
+      clearTimeout(this.hairWatchdog);
+      const oldW = this.hairWorker;
+      const oldUrl = this.hairBlobUrl;
+      this.hairWorker = null;
+      this.hairBlobUrl = null;
+      this.hairWorkerReady = false;
+      this.hairWorkerBusy = false;
+      this.hairReady = false;
+      if (!preserveStatus) this.hairWorkerStatus = this.hairProtectEnabled ? "待启动" : "未启用";
+      if (!oldW) {
+        if (oldUrl) try { URL.revokeObjectURL(oldUrl); } catch (_) {}
+        return;
+      }
+      const fin = () => {
+        try { oldW.terminate(); } catch (_) {}
+        if (oldUrl) try { URL.revokeObjectURL(oldUrl); } catch (_) {}
+      };
+      if (immediate) { fin(); return; }
+      try { oldW.postMessage({ type: "CLOSE" }); } catch (_) {}
+      setTimeout(fin, 60);
     }
 
     detectSceneCut(frameSource) {
@@ -2567,9 +2898,9 @@
       }
       const aspect = vw / Math.max(1, vh);
       const box = this.lastFaceBox;
-      if (box && (box.w < 0.26 || box.h < 0.36)) {
+      if (box && (box.w < 0.45 || box.h < 0.55)) {
         const faceSizeA = Math.max(box.w * aspect, box.h, 0.08);
-        const cropA = Math.max(0.32, Math.min(0.95, faceSizeA * 3.1));
+        const cropA = Math.max(0.32, Math.min(0.95, faceSizeA * 2.8));
         const rw = Math.min(1.0, cropA / aspect);
         const rh = Math.min(1.0, cropA);
         if (rw < 0.88 || rh < 0.88) {
@@ -2619,7 +2950,7 @@
         const exactRoi = { x: sx / vw, y: sy / vh, w: sw / vw, h: sh / vh };
 
         const baseEdge = this.degradeTier === "L0" ? this.adaptiveInferEdge : IS_IOS_OR_MOBILE ? 320 : 416;
-        const targetEdge = roi.isSmallCrop ? Math.min(384, baseEdge) : baseEdge;
+        const targetEdge = roi.isSmallCrop ? Math.max(448, Math.min(512, baseEdge)) : baseEdge;
         const scale = Math.min(1, targetEdge / Math.max(sw, sh));
         const tw = Math.max(32, Math.round(sw * scale));
         const th = Math.max(32, Math.round(sh * scale));
@@ -2630,6 +2961,7 @@
         }
         this.inferCtx.drawImage(frameSrc, sx, sy, sw, sh, 0, 0, tw, th);
         this.lastInferSentMs = captureTs;
+        this.facePxInfer = this.lastFaceBox ? Math.round(Math.max(this.lastFaceBox.w * vw, this.lastFaceBox.h * vh) * scale) : 0;
 
         if (this.mainTracker) {
           const res = this.mainTracker.detect(this.inferCanvas, exactRoi);
@@ -2695,6 +3027,12 @@
             { type: "FRAME", bitmap, frameId, timestampMs: captureTs, roi, sceneCut: isSceneCut, mode: "paired" },
             [bitmap]
           );
+          if (this.hairProtectEnabled && this.hairWorkerReady && !this.hairWorkerBusy) {
+            this.hairTick += 1;
+            if (this.hairTick % this.HAIR_EVERY === 0) {
+              this.dispatchHairFrame(roi);
+            }
+          }
         })
         .catch(() => { this.workerBusy = false; });
       return true;
@@ -2898,6 +3236,8 @@
       gl.uniform4f(this.uniforms.u_colorA, p.sharpen, p.exposure, p.contrast, p.saturation);
       gl.uniform4f(this.uniforms.u_colorB, p.temperature, p.softGlow, this.fadeWeight, this.degradeTier === "L2" ? 1 : 0);
       gl.uniform4f(this.uniforms.u_maskRect, mr[0], mr[1], mr[2], mr[3]);
+      gl.uniform4f(this.uniforms.u_hairRect, this.hairRect[0], this.hairRect[1], this.hairRect[2], this.hairRect[3]);
+      gl.uniform2f(this.uniforms.u_hairCtrl, this.hairReady && this.hairProtectEnabled ? 1.0 : 0.0, this.hairAmt);
       gl.uniform4f(
         this.uniforms.u_yawVis,
         hasFaceMask && a ? a.leftVis : 1.0,
@@ -2918,6 +3258,8 @@
         gl.uniform4f(this.uniforms.u_noseWings, a.noseWings[0], a.noseWings[1], a.noseWings[2], a.noseWings[3]);
       }
 
+      gl.activeTexture(gl.TEXTURE2);
+      gl.bindTexture(gl.TEXTURE_2D, this.hairTex);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
       this.renderMode = !this.enabled ? "off" : hasFaceMask ? "face_mask" : "skin_fallback";
       this.recordPerformance(performance.now() - t0, nowMs);
@@ -3081,8 +3423,41 @@
         }
       } else if (this.enabled && this.captureStatus === "ready") {
         this.ensureFaceTracking();
+        if (this.hairProtectEnabled && this.workerReady) this.ensureHairWorker();
       } else {
         this.workerStatus = "待开启美颜后启动";
+      }
+      this.onChange();
+    }
+
+    setHairProtectEnabled(flag) {
+      this.hairProtectEnabled = !!flag;
+      safeStorageSet(STORAGE_KEY_HAIR_OPT, this.hairProtectEnabled);
+      this.hairWorkerUnavailable = false;
+      if (this.hairProtectEnabled && !this.faceTrackingEnabled) {
+        this.setFaceTrackingEnabled(true);
+      }
+      if (!this.hairProtectEnabled) {
+        this.terminateHairWorker(false, true);
+        if (this.enabled && this.captureStatus === "ready") {
+          this.renderSingleFrame(performance.now(), { skipInfer: true });
+        }
+      } else if (this.enabled && this.faceTrackingEnabled && this.workerReady) {
+        this.ensureHairWorker();
+      } else {
+        this.hairWorkerStatus = this.enabled ? "待478点就绪后启动" : "待开启美颜后启动";
+      }
+      this.onChange();
+    }
+
+    setHdRenderEnabled(flag) {
+      this.hdRenderEnabled = !!flag;
+      safeStorageSet(STORAGE_KEY_HD_OPT, this.hdRenderEnabled);
+      if (this.canvas && this.video) {
+        this.syncCanvasGeometry();
+        if ((this.enabled || this.theaterActive) && this.captureStatus === "ready") {
+          this.renderSingleFrame(performance.now(), { skipInfer: true });
+        }
       }
       this.onChange();
     }
@@ -3171,6 +3546,8 @@
         theaterRotated: this.theaterRotated,
         theaterFill: this.theaterFill,
         faceTrackingEnabled: this.faceTrackingEnabled,
+        hairProtectEnabled: this.hairProtectEnabled,
+        hdRenderEnabled: this.hdRenderEnabled,
         params: { ...this.params },
         selectedVideoId: this.selectedVideoId,
         userLockedId: this.userLockedId,
@@ -3183,10 +3560,15 @@
         diagnostics: {
           adapterName: this.adapterName,
           degradeTier: this.degradeTier,
+          hdRender: this.hdRenderEnabled && this.degradeTier !== "L2" ? "超清 1080p" : "均衡省电",
           renderFps: this.renderFps,
           detectFps: this.detectFps,
           renderP95Ms: this.renderP95Ms,
           workerStatus: this.workerStatus,
+          hairWorker: this.hairProtectEnabled
+            ? (this.hairWorkerReady ? `就绪 (${this.hairDelegatePref} · ${this.hairSegMs}ms)` : this.hairWorkerStatus)
+            : "未启用",
+          facePxInfer: this.facePxInfer,
           droppedDelta: this.droppedDelta,
           lastCapturedMediaTime: this.lastCapturedMediaTime,
           overlayInfo,
@@ -3487,7 +3869,7 @@
     wrap.innerHTML = `
       <div class="fab-group" id="fabGroup">
         <div class="fab fab-fs hidden" id="fabFs" role="button" aria-label="美颜全屏">⛶ 全屏</div>
-        <div class="fab" id="fab" role="button" aria-label="打开实时美颜">
+        <div class="fab" id="fab" role="button" aria-label="打开沉浸式观影美颜">
           <span class="dot"></span><span id="fabText">美颜</span>
         </div>
       </div>
@@ -3530,8 +3912,8 @@
       <div class="panel hidden" id="panel">
         <div class="header">
           <div>
-            <h1>实时美颜</h1>
-            <p class="sub">iOS Safari · 26 项专业调参 + 剧场横屏</p>
+            <h1>沉浸式观影</h1>
+            <p class="sub">iOS Safari · 26 项专业美颜 + 剧场横屏</p>
           </div>
           <div class="hdr-right">
             <label class="switch" title="开启或关闭美颜"><input type="checkbox" id="toggleBeauty" /><span class="sw-track"></span></label>
@@ -3554,6 +3936,14 @@
           <div class="row" style="margin-top:2px;">
             <span class="muted">478 点人脸遮罩（在线加载，解锁美型/美妆）</span>
             <label class="switch"><input type="checkbox" id="toggleFace" /><span class="sw-track"></span></label>
+          </div>
+          <div class="row" style="margin-top:4px;">
+            <span class="muted">发丝防糊保护（防刘海/碎发刷白，联动478点）</span>
+            <label class="switch"><input type="checkbox" id="toggleHair" /><span class="sw-track"></span></label>
+          </div>
+          <div class="row" style="margin-top:4px;">
+            <span class="muted">超清 1080p 渲染（视网膜高清，发热自动降级）</span>
+            <label class="switch"><input type="checkbox" id="toggleHd" /><span class="sw-track"></span></label>
           </div>
         </div>
 
@@ -3668,6 +4058,8 @@
       panel: $("panel"),
       toggleBeauty: $("toggleBeauty"),
       toggleFace: $("toggleFace"),
+      toggleHair: $("toggleHair"),
+      toggleHd: $("toggleHd"),
       btnClose: $("btnClose"),
       btnRescan: $("btnRescan"),
       videoSelect: $("videoSelect"),
@@ -3946,6 +4338,8 @@
 
       ui.toggleBeauty.checked = !!st.enabled;
       ui.toggleFace.checked = !!st.faceTrackingEnabled;
+      ui.toggleHair.checked = !!st.hairProtectEnabled;
+      ui.toggleHd.checked = !!st.hdRenderEnabled;
       ui.btnEnterTheater.textContent = st.theaterActive ? "退出全屏" : "⛶ 美颜全屏";
       if (!isDragging) syncSliders(st.params);
 
@@ -3992,10 +4386,11 @@
       const d = st.diagnostics;
       const rows = [
         ["站点适配器", d.adapterName],
-        ["降级档位", d.degradeTier],
+        ["画质档位", `${d.hdRender} (${d.degradeTier})`],
         ["渲染 / 检测", `${d.renderFps} / ${d.detectFps} fps`],
         ["渲染耗时 (P95)", `${d.renderP95Ms.toFixed(1)} ms`],
-        ["人脸追踪", d.workerStatus],
+        ["人脸追踪", d.facePxInfer ? `${d.workerStatus} (${d.facePxInfer}px)` : d.workerStatus],
+        ["发丝保护", d.hairWorker],
         ["叠层状态", d.overlayInfo],
         ["全屏状态", d.fullscreenState],
       ];
@@ -4046,10 +4441,50 @@
       renderUI();
     });
 
-    // Theater Stage touch interactions (tap toggles HUD, double-tap toggles play/pause)
+    // Theater Stage touch interactions (tap toggles HUD, double-tap toggles play/pause, long-press peeks original)
     let lastStageTap = 0;
     let singleTapTimer = null;
+    let pressTimer = null;
+    let pressActive = false;
+    let pressStart = null;
+    let suppressNextClick = false;
+    const cancelPressCompare = () => {
+      if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+      pressStart = null;
+      if (pressActive) {
+        pressActive = false;
+        if (engine) engine.setCompareOriginal(false);
+        setTimeout(() => { suppressNextClick = false; }, 120);
+      }
+    };
+    ui.theaterMediaSlot.addEventListener("pointerdown", (e) => {
+      if (panelOpen || !engine || !engine.theaterActive) return;
+      cancelPressCompare();
+      pressStart = { x: e.clientX, y: e.clientY };
+      pressTimer = setTimeout(() => {
+        pressTimer = null;
+        if (!engine || !engine.theaterActive || panelOpen) return;
+        pressActive = true;
+        suppressNextClick = true;
+        engine.setCompareOriginal(true);
+        showToast("原画对比中 · 松手恢复美颜");
+      }, 320);
+    });
+    ui.theaterMediaSlot.addEventListener("pointermove", (e) => {
+      if (!pressStart || !pressTimer) return;
+      if (Math.hypot(e.clientX - pressStart.x, e.clientY - pressStart.y) > 12) {
+        clearTimeout(pressTimer);
+        pressTimer = null;
+      }
+    });
+    ui.theaterMediaSlot.addEventListener("pointerup", cancelPressCompare);
+    ui.theaterMediaSlot.addEventListener("pointercancel", cancelPressCompare);
+
     ui.theaterMediaSlot.addEventListener("click", () => {
+      if (suppressNextClick) {
+        suppressNextClick = false;
+        return;
+      }
       if (panelOpen) {
         panelOpen = false;
         ui.panel.classList.add("hidden");
@@ -4173,6 +4608,8 @@
 
     ui.toggleBeauty.addEventListener("change", () => engine.setEnabled(ui.toggleBeauty.checked));
     ui.toggleFace.addEventListener("change", () => engine.setFaceTrackingEnabled(ui.toggleFace.checked));
+    ui.toggleHair.addEventListener("change", () => engine.setHairProtectEnabled(ui.toggleHair.checked));
+    ui.toggleHd.addEventListener("change", () => engine.setHdRenderEnabled(ui.toggleHd.checked));
     ui.btnRescan.addEventListener("click", () => { engine.scanVideos(); renderUI(); });
     ui.btnRetry.addEventListener("click", () => { engine.probeAttempts = 0; engine.workerUnavailable = false; engine.runProtectionAndProbe(); renderUI(); });
     ui.btnEnterTheater.addEventListener("click", () => {
@@ -4323,7 +4760,7 @@
       mountUI();
     } catch (err) {
       const badge = document.createElement("div");
-      badge.textContent = "实时美颜启动异常: " + (err && err.message ? err.message : String(err));
+      badge.textContent = "沉浸式观影启动异常: " + (err && err.message ? err.message : String(err));
       badge.style.cssText =
         "position:fixed;right:10px;bottom:80px;z-index:2147483647;background:#7f1d1d;color:#fff;padding:8px 10px;border-radius:8px;font-size:12px;max-width:85vw;";
       (document.body || document.documentElement).appendChild(badge);
