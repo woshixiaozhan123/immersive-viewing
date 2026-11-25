@@ -1,10 +1,27 @@
 # 更新日志（Changelog）
 
-本文档记录 **实时美颜（realtime-beauty）** 的重要功能演进、修复与架构调整，按时间倒序排列。
+本文档记录 **沉浸式观影（原实时美颜 / realtime-beauty）** 的重要功能演进、修复与架构调整，按时间倒序排列。
 
 ---
 
-## [未发布] - 2026-11-24
+## [1.2.0] - 2026-11-25
+
+### 新增（Added）
+- **本地离线 AI 中文字幕（日/英 → 简体中文）**：
+  - [cache-server/subtitles.py](cache-server/subtitles.py)、[subtitle_inference.py](cache-server/subtitle_inference.py)、[subtitle_profiles.py](cache-server/subtitle_profiles.py)、[subtitle_api.py](cache-server/subtitle_api.py)、[content/subtitles.js](content/subtitles.js)：仅读取本机已落盘分片，使用 `faster-whisper small` 转写 + 本地 `llama-server` 跑混元 `Hy-MT2-1.8B-Q4_K_M` 翻译，按播放头超前 30 秒生成、支持跳播优先与旧任务即时取消，支持中文字幕 / 双语字幕按域名记忆。
+- **硬件自适应分级 + 双模型热复用 + 测速缓存**：
+  - 取消原先 4 核硬限制，按主机内存与 CPU 逻辑核数自动分级（`low` / `medium` / `high`，高配机放开 Whisper 至 `min(10, 核/2)` 线程、`beam_size=2`），引入 `WhisperWorkerPool` 与 `TranslatorPool` 连续播放热复用，闲置 90–180 秒一级休眠卸载，实时可用内存跌破阈值时自动触发安全阀降级；选档测速按硬件/模型指纹持久化至 `profile-cache.json`。
+- **Native Messaging 按需自动启动 + 30 分钟空闲自动退出**：
+  - [cache-server/native-host/](cache-server/native-host/)（含 `setup-local.ps1` 一键环境安装脚本与 `install-host.ps1` 注册脚本）+ [cache-server/idle.py](cache-server/idle.py) + [background/grab-bridge.js](background/grab-bridge.js)：平时后台 0 进程，仅在开启缓存、字幕、媒体库或删除缓存时按需拉起；看门狗忽略 `/health` 探针，连续 30 分钟无真实业务活动且无后台任务时优雅退出。一键安装支持按硬件配置交互式或 `-Model` 自选翻译模型（`Hy-MT2-1.8B` / `Qwen2.5-3B` / `Qwen2.5-7B`）。
+- **音视频分离 & fMP4 HLS 支持 + XHR/fetch 拦截**：
+  - [content/grab-hook.js](content/grab-hook.js) 新增 `XMLHttpRequest.open` 与 `window.fetch` 的 `.m3u8` 改写，覆盖未挂载全局 `window.Hls` 的 webpack 打包播放器；
+  - [cache-server/hls_proxy.py](cache-server/hls_proxy.py)、[webui.py](cache-server/webui.py)、[subtitles.py](cache-server/subtitles.py) 全面支持 `#EXT-X-MEDIA:TYPE=AUDIO` 独立音频流与 `#EXT-X-MAP` fMP4 初始化头（含在线缓存、字幕抽音轨、离线播放与缩略图抽帧）。
+- **UI 打磨与更名「沉浸式观影」**：
+  - 扩展及本地播放器对外名称统一升级为「**沉浸式观影**」；新增面板「字幕字号 / 高度」微调滑块、按状态智能提示、「媒体库↗」快捷入口与媒体库卡片「预扫人脸」一键触发按钮；修复隔离世界导致的「缓存脚本未注入本页」误报。
+
+---
+
+## [1.1.5] - 2026-11-24
 
 ### 新增（Added）
 - **离线人脸关键点预扫与查表兜底（`prescan`）**：解决侧脸、运动模糊、远景小脸等实时单帧检测容易掉回「肤色保边回退（`skin_fallback`）」的问题

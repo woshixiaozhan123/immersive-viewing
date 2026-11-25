@@ -143,9 +143,16 @@ for ($depth = 0; $depth -lt 5 -and $cursor; $depth++) {
     }
 }
 
-$llamaCandidates = @($LlamaBin, $existingEnv["RB_SUBS_LLAMA_BIN"], $env:RB_SUBS_LLAMA_BIN, "C:\tools\llama.cpp\llama-server.exe")
-$llamaGpuCandidates = @($LlamaGpuBin, $existingEnv["RB_SUBS_LLAMA_GPU_BIN"], $env:RB_SUBS_LLAMA_GPU_BIN)
-$mtModelCandidates = @($MtModel, $existingEnv["RB_SUBS_MT_MODEL"], $env:RB_SUBS_MT_MODEL, "C:\models\Hy-MT2-1.8B-Q4_K_M.gguf")
+$runtimeLlama = Join-Path $CacheServerDir "runtime\llama\llama-server.exe"
+$runtimeModels = @(
+    (Join-Path $CacheServerDir "runtime\models\Hy-MT2-1.8B-Q4_K_M.gguf"),
+    (Join-Path $CacheServerDir "runtime\models\qwen2.5-3b-instruct-q4_k_m.gguf"),
+    (Join-Path $CacheServerDir "runtime\models\Qwen2.5-7B-Instruct-Q4_K_M.gguf")
+)
+
+$llamaCandidates = @($LlamaBin, $existingEnv["RB_SUBS_LLAMA_BIN"], $env:RB_SUBS_LLAMA_BIN, $runtimeLlama, "C:\tools\llama.cpp\llama-server.exe")
+$llamaGpuCandidates = @($LlamaGpuBin, $existingEnv["RB_SUBS_LLAMA_GPU_BIN"], $env:RB_SUBS_LLAMA_GPU_BIN, $runtimeLlama)
+$mtModelCandidates = @($MtModel, $existingEnv["RB_SUBS_MT_MODEL"], $env:RB_SUBS_MT_MODEL) + $runtimeModels + @("C:\models\Hy-MT2-1.8B-Q4_K_M.gguf")
 foreach ($bd in $benchDirs) {
     $llamaCandidates += (Join-Path $bd "engine\llama-server.exe")
     $llamaGpuCandidates += (Join-Path $bd "engine-vulkan\llama-server.exe")

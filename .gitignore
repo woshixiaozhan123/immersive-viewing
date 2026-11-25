@@ -21,6 +21,7 @@ cache-server/native-host/env.json
 cache-server/native-host/com.realtime_beauty.cache_host.json
 cache-server/native-host/launch.lock
 cache-server/native-host/profile-cache.json
+cache-server/runtime/
 
 # Heavy MediaPipe binaries (fetched cleanly via `npm run setup` or bundled in GitHub Releases)
 vendor/mediapipe/vision_bundle.mjs

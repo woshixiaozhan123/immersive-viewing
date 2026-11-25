@@ -388,7 +388,7 @@ class LocalTranslator:
                   or os.environ.get("RB_SUBS_LLAMA_GPU_BIN"))
         model = os.environ.get("RB_SUBS_MT_MODEL")
         if not binary or not model or not Path(model).is_file():
-            raise RuntimeError("请配置本机 llama-server 和混元 Hy-MT2 1.8B Q4 模型")
+            raise RuntimeError("请配置本机 llama-server 和本地翻译模型（如 Hy-MT2-1.8B / Qwen2.5-3B GGUF）")
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
             self.port = s.getsockname()[1]
@@ -409,7 +409,7 @@ class LocalTranslator:
                     return self
                 except (URLError, TimeoutError):
                     time.sleep(0.12)
-            raise RuntimeError("本地混元启动失败，请检查 llama-server 和模型格式")
+            raise RuntimeError("本地翻译服务启动失败，请检查 llama-server 和模型格式")
         except (OSError, RuntimeError, InferenceCancelled):
             self.close()
             raise
@@ -466,7 +466,7 @@ class LocalTranslator:
                         check_cancelled(active_cancel)
                         one = self._request_lines([cue], context)
                         if len(one) != 1 or not one[0]:
-                            raise RuntimeError("混元返回的译文与字幕条数不匹配")
+                            raise RuntimeError("本地翻译模型返回的译文与字幕条数不匹配")
                         parts.append(one[0])
                 result.update({cue["id"]: zh for cue, zh in zip(batch, parts, strict=True)})
                 context = [*context, *(cue["src"] for cue in batch)][-2:]
