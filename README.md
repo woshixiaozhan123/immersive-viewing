@@ -53,7 +53,7 @@ flowchart LR
 ## 快速安装（桌面端 Chromium 浏览器）
 
 ### 方式一：直接下载 Release 预构建包（推荐普通用户）
-1. 前往 [Releases 页面](https://github.com/woshixiaozhan123/realtime-beauty/releases) 下载 `realtime-beauty-v1.1.0.zip` 并解压。
+1. 前往 [Releases 页面](https://github.com/woshixiaozhan123/immersive-viewing/releases) 下载 `immersive-viewing-v1.1.0.zip` 并解压。
 2. 打开浏览器扩展管理页：
    - Chrome：`chrome://extensions`
    - Edge：`edge://extensions`
@@ -65,8 +65,8 @@ flowchart LR
 > 需要 Node.js >= 18（零 npm 第三方运行时依赖）。
 
 ```bash
-git clone https://github.com/woshixiaozhan123/realtime-beauty.git
-cd realtime-beauty
+git clone https://github.com/woshixiaozhan123/immersive-viewing.git
+cd immersive-viewing
 
 # 1. 下载官方离线 MediaPipe WASM 与 478 点人脸模型到 vendor/mediapipe/
 npm run setup
@@ -236,7 +236,7 @@ python ../scripts/check_landmarks.py ~/Videos/grab-cache/<safeKey>/landmarks.bin
 ### 安装步骤（Userscripts / Stay）
 1. 在 App Store 安装免费开源的 **Userscripts**（或 **Stay**），并在 iOS「设置 → Safari 浏览器 → 扩展」中开启并授予网站权限。
 2. 下载或直接从 Raw 链接安装脚本：
-   `https://raw.githubusercontent.com/woshixiaozhan123/realtime-beauty/main/ios/realtime-beauty-ios.user.js`
+   `https://raw.githubusercontent.com/woshixiaozhan123/immersive-viewing/main/ios/realtime-beauty-ios.user.js`
 3. 若使用 **Userscripts**：将脚本保存到 iCloud Drive /「我的 iPhone」下的 Userscripts 目录，刷新 Safari 视频页即可在右下角看到悬浮球。
 
 ### iOS 美颜剧场全屏 & 90° 横屏
@@ -260,7 +260,7 @@ python ../scripts/check_landmarks.py ~/Videos/grab-cache/<safeKey>/landmarks.bin
 ## 目录结构
 
 ```text
-realtime-beauty/
+immersive-viewing/
 ├── manifest.json                 # MV3 清单（icons + wasm-unsafe-eval）
 ├── CHANGELOG.md                  # 版本与功能更新日志
 ├── HANDOVER.md                   # 架构说明与实测交接文档
