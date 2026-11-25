@@ -90,7 +90,7 @@ IDLE_SHUTDOWN_MINUTES: float = float(os.environ.get("RB_IDLE_SHUTDOWN_MIN", "30"
 IDLE_CHECK_INTERVAL_SEC: float = max(0.5, float(os.environ.get("RB_IDLE_CHECK_SEC", "30")))
 
 # ---------------------------------------------------------------------------
-# 离线人脸关键点预扫（HANDOVER-PRESCAN.md）
+# 离线人脸关键点预扫
 # ---------------------------------------------------------------------------
 PRESCAN_FPS: int = max(1, int(os.environ.get("RB_PRESCAN_FPS", "4")))
 PRESCAN_MAX_FRAMES: int = max(100, int(os.environ.get("RB_PRESCAN_MAX_FRAMES", "400000")))

@@ -225,7 +225,7 @@ python ../scripts/check_landmarks.py ~/Videos/grab-cache/<safeKey>/landmarks.bin
 **服务没启动时会自动降级**：扩展探测 `/health` 失败 → `serverOnline=false` → 不改写任何 m3u8 → 原站播放器行为与没装扩展完全一致。
 
 - 播放列表由**磁盘状态**现场生成，默认只列已落盘分片，原站 token 过期也能完整回看。
-- 详细架构、实测数据与变更记录见 [HANDOVER.md](HANDOVER.md) 与 [CHANGELOG.md](CHANGELOG.md)。
+- 详细变更记录与实测摘要见 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 
@@ -263,7 +263,6 @@ python ../scripts/check_landmarks.py ~/Videos/grab-cache/<safeKey>/landmarks.bin
 immersive-viewing/
 ├── manifest.json                 # MV3 清单（icons + wasm-unsafe-eval）
 ├── CHANGELOG.md                  # 版本与功能更新日志
-├── HANDOVER.md                   # 架构说明与实测交接文档
 ├── icons/                        # 16 / 48 / 128 扩展图标
 ├── popup/                        # 26 项 Wink/剪映专业分项调参面板、预设、JSON 方案与诊断
 ├── content/

@@ -13,8 +13,9 @@ __pycache__/
 Thumbs.db
 *.log
 
-# Local scratch (playwright snapshots, ad-hoc screenshots)
+# Local scratch (playwright snapshots, ad-hoc screenshots, internal handover notes)
 .playwright-cli/
+HANDOVER*.md
 
 # Runtime cache of the local player (thumbnails etc. live outside the repo, nothing here)
 cache-server/native-host/env.json
