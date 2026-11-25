@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
+import signal
 import sys
 import threading
 from collections import deque
@@ -15,11 +17,12 @@ from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 import config
+import idle
 import prescan
 import prescan_api
 import subtitle_api
 import webui
-from hls_proxy import TransparentHlsCache, b64d, safe_key_of
+from hls_proxy import TransparentHlsCache, b64d, detect_segment_media_type, safe_key_of
 from maintenance import CacheSweeper
 from models import (
     EnqueueRequest,
@@ -80,6 +83,48 @@ def _is_v2_key(key: str) -> bool:
     return key.startswith(("bili:", "yt:", "bili_", "yt_"))
 
 
+_uvicorn_server = None
+
+
+def set_uvicorn_server(srv) -> None:
+    global _uvicorn_server
+    _uvicorn_server = srv
+
+
+def _is_server_busy() -> bool:
+    return bool(prescan.is_running() or subtitle_api.is_busy())
+
+
+def _force_exit_watchdog() -> None:
+    logger.warning("Graceful shutdown timed out after 8s; forcing exit")
+    try:
+        subtitle_api.close()
+    except Exception:  # noqa: BLE001
+        pass
+    os._exit(0)
+
+
+def _request_graceful_shutdown() -> None:
+    timer = threading.Timer(8.0, _force_exit_watchdog)
+    timer.daemon = True
+    timer.start()
+    if _uvicorn_server is not None:
+        _uvicorn_server.should_exit = True
+        return
+    try:
+        os.kill(os.getpid(), signal.SIGINT)
+    except Exception:  # noqa: BLE001
+        _force_exit_watchdog()
+
+
+idle_watchdog = idle.IdleWatchdog(
+    timeout_sec=config.IDLE_SHUTDOWN_MINUTES * 60.0,
+    check_interval_sec=config.IDLE_CHECK_INTERVAL_SEC,
+    is_busy_fn=_is_server_busy,
+    shutdown_fn=_request_graceful_shutdown,
+)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     config.GRAB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -95,10 +140,12 @@ async def lifespan(_app: FastAPI):
     if stale_prescan:
         logger.warning("Reset %d stale running prescan state(s) to failed", stale_prescan)
     sweeper.start()
+    idle_watchdog.start()
     try:
         yield
     finally:
         logger.info("Shutting down cache server...")
+        idle_watchdog.stop()
         subtitle_api.close()
         sweeper.stop()
         hls_cache.close()
@@ -108,7 +155,7 @@ async def lifespan(_app: FastAPI):
             storage.flush_all()
 
 
-app = FastAPI(title="Realtime Beauty Local Video Cache Server (v3)", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="沉浸式观影 · 本地缓存与字幕服务", version="3.0.0", lifespan=lifespan)
 
 _cors_kwargs: dict = {
     "allow_origins": ["*"],
@@ -136,7 +183,14 @@ app.include_router(subtitle_api.router)
 
 @app.middleware("http")
 async def add_pna_and_cors_headers(request: Request, call_next):
-    response = await call_next(request)
+    track_idle = idle.is_activity_path(request.url.path)
+    if track_idle:
+        idle_watchdog.enter_request()
+    try:
+        response = await call_next(request)
+    finally:
+        if track_idle:
+            idle_watchdog.exit_request()
     # Chrome Private Network Access (public HTTPS page -> http://127.0.0.1 loopback)
     if (
         request.headers.get("access-control-request-private-network") == "true"
@@ -161,6 +215,7 @@ def health() -> dict:
         "transport": "curl_cffi",
         "pipeline": "transparent-hls-segment-cache",
         "hlsStats": dict(hls_cache.stats),
+        "idle": idle_watchdog.status(),
     }
 
 
@@ -232,7 +287,60 @@ def hls_segment(safe_key: str, idx: int) -> Response:
 
     headers = dict(_HLS_HEADERS)
     headers["Content-Length"] = str(len(data))
-    return Response(content=data, media_type="video/mp2t", headers=headers)
+    return Response(content=data, media_type=detect_segment_media_type(data, "v"), headers=headers)
+
+
+@app.get("/hls/{safe_key}/a/{variant}.m3u8")
+def hls_audio_variant(safe_key: str, variant: str, u: str, ref: str = "") -> Response:
+    """拉取独立音频 playlist，改写 #EXT-X-MAP 与分片地址到 /hls/{key}/aseg/{idx}。"""
+    try:
+        variant_url = b64d(u)
+        referer = b64d(ref) if ref else ""
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"bad u/ref: {exc}") from exc
+    try:
+        body = hls_cache.handle_audio_variant(safe_key, variant_url, referer)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[hls][audio] %s failed: %s", safe_key, exc)
+        raise HTTPException(status_code=502, detail=str(exc)[:200]) from exc
+    return _m3u8_response(body)
+
+
+@app.get("/hls/{safe_key}/aseg/{idx}")
+def hls_audio_segment(safe_key: str, idx: int) -> Response:
+    """独立音频分片命中/回源缓存。"""
+    try:
+        data = hls_cache.get_audio_segment(safe_key, idx)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[hls][aseg] %s#%d failed: %s", safe_key, idx, exc)
+        raise HTTPException(status_code=502, detail=str(exc)[:160]) from exc
+    if data is None:
+        raise HTTPException(status_code=404, detail="audio segment not registered")
+
+    hls_cache.prefetch_audio(safe_key, idx)
+
+    headers = dict(_HLS_HEADERS)
+    headers["Content-Length"] = str(len(data))
+    return Response(content=data, media_type=detect_segment_media_type(data, "a"), headers=headers)
+
+
+@app.get("/hls/{safe_key}/map/{track}")
+def hls_init_map(safe_key: str, track: str) -> Response:
+    """fMP4 初始化头（#EXT-X-MAP）缓存代理。"""
+    if track not in ("v", "a"):
+        raise HTTPException(status_code=404, detail="invalid map track")
+    try:
+        data = hls_cache.get_init_map(safe_key, track)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[hls][map] %s/%s failed: %s", safe_key, track, exc)
+        raise HTTPException(status_code=502, detail=str(exc)[:160]) from exc
+    if data is None:
+        raise HTTPException(status_code=404, detail="init map not registered")
+
+    headers = dict(_HLS_HEADERS)
+    headers["Content-Length"] = str(len(data))
+    media_type = "audio/mp4" if track == "a" else "video/mp4"
+    return Response(content=data, media_type=media_type, headers=headers)
 
 
 @app.get("/api/video/{key:path}")

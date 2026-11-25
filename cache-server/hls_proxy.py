@@ -111,15 +111,20 @@ def safe_key_of(page_url: str) -> str:
     return safe_key
 
 
-def pick_best_variant(
-    text: str, base_url: str, preferred_height: int = 0
-) -> Optional[tuple[str, int, str]]:
-    """返回 (variant_url, bandwidth, resolution)。
+def detect_segment_media_type(data: bytes, track: str = "v") -> str:
+    if data and data[0] == 0x47:
+        return "video/mp2t"
+    if len(data) >= 8 and data[4:8] in (b"ftyp", b"styp", b"moof", b"moov", b"sidx", b"mdat"):
+        return "audio/mp4" if track == "a" else "video/mp4"
+    return "audio/mp4" if track == "a" else "video/mp2t"
 
-    preferred_height > 0 时优先选高度不超过它的最高码率档；没有可选才退回最高档。
-    """
+
+def pick_best_variant_ext(
+    text: str, base_url: str, preferred_height: int = 0
+) -> Optional[dict[str, Any]]:
+    """返回选中变体的详细信息（url/bandwidth/resolution/height/audioGroup/codecs）。"""
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    variants: list[tuple[str, int, str, int]] = []
+    variants: list[dict[str, Any]] = []
     i = 0
     while i < len(lines):
         line = lines[i]
@@ -141,22 +146,73 @@ def pick_best_variant(
                 j += 1
             if j < len(lines):
                 vurl = inherit_query(urljoin(base_url, lines[j]), base_url)
-                variants.append((vurl, bw, res, height))
+                variants.append(
+                    {
+                        "url": vurl,
+                        "bandwidth": bw,
+                        "resolution": res,
+                        "height": height,
+                        "audioGroup": attrs.get("AUDIO", ""),
+                        "codecs": attrs.get("CODECS", ""),
+                    }
+                )
                 i = j
         i += 1
 
     if not variants:
         return None
 
-    variants.sort(key=lambda v: v[1], reverse=True)
+    variants.sort(key=lambda v: v["bandwidth"], reverse=True)
     if preferred_height > 0:
-        eligible = [v for v in variants if v[3] and v[3] <= preferred_height]
+        eligible = [v for v in variants if v["height"] and v["height"] <= preferred_height]
         if eligible:
-            eligible.sort(key=lambda v: v[1], reverse=True)
-            url, bw, res, _ = eligible[0]
-            return url, bw, res
-    url, bw, res, _ = variants[0]
-    return url, bw, res
+            eligible.sort(key=lambda v: v["bandwidth"], reverse=True)
+            return eligible[0]
+    return variants[0]
+
+
+def pick_best_variant(
+    text: str, base_url: str, preferred_height: int = 0
+) -> Optional[tuple[str, int, str]]:
+    """返回 (variant_url, bandwidth, resolution)。"""
+    chosen = pick_best_variant_ext(text, base_url, preferred_height)
+    if chosen is None:
+        return None
+    return chosen["url"], chosen["bandwidth"], chosen["resolution"]
+
+
+def pick_audio_rendition(text: str, base_url: str, group_id: str = "") -> Optional[dict[str, str]]:
+    """从 master m3u8 中提取匹配的独立音频轨（#EXT-X-MEDIA:TYPE=AUDIO）。"""
+    candidates: list[dict[str, str]] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line.startswith("#EXT-X-MEDIA:"):
+            continue
+        attrs = _parse_attr_list(line[len("#EXT-X-MEDIA:") :])
+        if attrs.get("TYPE", "").upper() != "AUDIO":
+            continue
+        uri = attrs.get("URI", "").strip()
+        if not uri:
+            continue
+        candidates.append(
+            {
+                "uri": inherit_query(urljoin(base_url, uri), base_url),
+                "groupId": attrs.get("GROUP-ID", "") or "audio",
+                "name": attrs.get("NAME", "") or "Audio",
+                "language": attrs.get("LANGUAGE", ""),
+                "default": attrs.get("DEFAULT", "").upper(),
+            }
+        )
+    if not candidates:
+        return None
+    if group_id:
+        grouped = [c for c in candidates if c["groupId"] == group_id]
+        if grouped:
+            candidates = grouped
+    for c in candidates:
+        if c["default"] == "YES":
+            return c
+    return candidates[0]
 
 
 def inherit_query(child_url: str, parent_url: str) -> str:
@@ -190,11 +246,12 @@ class TransparentHlsCache:
         self._meta_locks: dict[str, threading.Lock] = {}
         self._meta_guard = threading.Lock()
 
-        self._inflight: set[tuple[str, int]] = set()
+        self._inflight: set[tuple[Any, ...]] = set()
         self._inflight_guard = threading.Lock()
 
         # safeKey -> [segment urls]，避免每次请求都读文件
         self._seg_cache: dict[str, list[str]] = {}
+        self._audio_seg_cache: dict[str, list[str]] = {}
 
         self._fetch_sem = threading.Semaphore(max(1, config.HLS_MAX_CONCURRENT_FETCH))
         self._prefetch_pool = ThreadPoolExecutor(
@@ -218,34 +275,50 @@ class TransparentHlsCache:
     def seg_path(self, safe_key: str, idx: int) -> Path:
         return self.entry_dir(safe_key) / "segs" / f"{idx:06d}.ts"
 
+    def audio_seg_path(self, safe_key: str, idx: int) -> Path:
+        return self.entry_dir(safe_key) / "asegs" / f"{idx:06d}.seg"
+
     # -- 分片 URL 索引（单独文件，避免 meta.json 膨胀到几百 KB）-----------
     def seg_index_path(self, safe_key: str) -> Path:
         return self.entry_dir(safe_key) / "segments.txt"
 
-    def read_segments(self, safe_key: str) -> list[str]:
-        cached = self._seg_cache.get(safe_key)
+    def audio_seg_index_path(self, safe_key: str) -> Path:
+        return self.entry_dir(safe_key) / "audio_segments.txt"
+
+    def _read_index_urls(self, cache_map: dict[str, list[str]], path: Path, safe_key: str) -> list[str]:
+        cached = cache_map.get(safe_key)
         if cached is not None:
             return cached
-        p = self.seg_index_path(safe_key)
-        if not p.exists():
+        if not path.exists():
             return []
         try:
-            urls = p.read_text(encoding="utf-8").splitlines()
+            urls = path.read_text(encoding="utf-8").splitlines()
         except OSError:
             return []
-        self._seg_cache[safe_key] = urls
+        cache_map[safe_key] = urls
         return urls
 
-    def write_segments(self, safe_key: str, urls: list[str]) -> None:
-        p = self.seg_index_path(safe_key)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".part")
+    def _write_index_urls(self, cache_map: dict[str, list[str]], path: Path, safe_key: str, urls: list[str]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".part")
         try:
             tmp.write_text("\n".join(urls), encoding="utf-8")
-            tmp.replace(p)
-            self._seg_cache[safe_key] = list(urls)
+            tmp.replace(path)
+            cache_map[safe_key] = list(urls)
         except OSError as exc:
             logger.warning("write segments index failed %s: %s", safe_key, exc)
+
+    def read_segments(self, safe_key: str) -> list[str]:
+        return self._read_index_urls(self._seg_cache, self.seg_index_path(safe_key), safe_key)
+
+    def write_segments(self, safe_key: str, urls: list[str]) -> None:
+        self._write_index_urls(self._seg_cache, self.seg_index_path(safe_key), safe_key, urls)
+
+    def read_audio_segments(self, safe_key: str) -> list[str]:
+        return self._read_index_urls(self._audio_seg_cache, self.audio_seg_index_path(safe_key), safe_key)
+
+    def write_audio_segments(self, safe_key: str, urls: list[str]) -> None:
+        self._write_index_urls(self._audio_seg_cache, self.audio_seg_index_path(safe_key), safe_key, urls)
 
     def _lock_for(self, safe_key: str) -> threading.Lock:
         with self._meta_guard:
@@ -330,11 +403,15 @@ class TransparentHlsCache:
             # 已经是 media playlist，直接改写
             return self.rewrite_media(safe_key, text, media_url, referer, media_url)
 
-        best = pick_best_variant(text, media_url, config.HLS_PREFERRED_HEIGHT)
-        if best is None:
+        chosen = pick_best_variant_ext(text, media_url, config.HLS_PREFERRED_HEIGHT)
+        if chosen is None:
             raise RuntimeError("master playlist has no variant")
 
-        variant_url, bandwidth, resolution = best
+        variant_url = chosen["url"]
+        bandwidth = chosen["bandwidth"]
+        resolution = chosen["resolution"]
+        audio = pick_audio_rendition(text, media_url, chosen.get("audioGroup", ""))
+
         meta = self.read_meta(safe_key)
         meta.update(
             {
@@ -345,6 +422,7 @@ class TransparentHlsCache:
                 "mode": "transparent-hls",
                 "bandwidth": bandwidth,
                 "resolution": resolution,
+                "hasAudioTrack": audio is not None,
                 "segmentDuration": 0,
                 "totalSegments": meta.get("totalSegments", 0),
                 "cachedCount": meta.get("cachedCount", 0),
@@ -355,24 +433,68 @@ class TransparentHlsCache:
         self.write_meta(safe_key, meta)
 
         logger.info(
-            "[hls][master] %s -> %sx (bw=%d) variants->1",
+            "[hls][master] %s -> %sx (bw=%d, audio=%s) variants->1",
             safe_key,
             resolution or "?",
             bandwidth,
+            "separate" if audio else "muxed",
         )
 
-        return (
-            "#EXTM3U\n"
-            "#EXT-X-VERSION:3\n"
-            f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth}'
-            + (f",RESOLUTION={resolution}" if resolution else "")
-            + "\n"
-            f"/hls/{safe_key}/v/0.m3u8?u={b64e(variant_url)}\n"
-        )
+        lines = ["#EXTM3U"]
+        if audio is not None:
+            gid = audio["groupId"].replace('"', "") or "audio"
+            aname = audio["name"].replace('"', "") or "Audio"
+            lang_attr = f',LANGUAGE="{audio["language"]}"' if audio.get("language") else ""
+            lines.append("#EXT-X-VERSION:4")
+            lines.append(
+                f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="{gid}",NAME="{aname}",'
+                f'DEFAULT=YES,AUTOSELECT=YES{lang_attr},'
+                f'URI="/hls/{safe_key}/a/0.m3u8?u={b64e(audio["uri"])}"'
+            )
+            stream_inf = f"#EXT-X-STREAM-INF:BANDWIDTH={bandwidth}"
+            if resolution:
+                stream_inf += f",RESOLUTION={resolution}"
+            if chosen.get("codecs"):
+                stream_inf += f',CODECS="{chosen["codecs"]}"'
+            stream_inf += f',AUDIO="{gid}"'
+            lines.append(stream_inf)
+        else:
+            lines.append("#EXT-X-VERSION:3")
+            lines.append(
+                f"#EXT-X-STREAM-INF:BANDWIDTH={bandwidth}"
+                + (f",RESOLUTION={resolution}" if resolution else "")
+            )
+        lines.append(f"/hls/{safe_key}/v/0.m3u8?u={b64e(variant_url)}")
+        return "\n".join(lines) + "\n"
+
+    def _rewrite_map_line(self, line: str, base_url: str, safe_key: str, track: str) -> str:
+        m = re.search(r'URI="([^"]+)"', line, flags=re.IGNORECASE)
+        if not m:
+            return line
+        abs_map_url = inherit_query(urljoin(base_url, m.group(1)), base_url)
+        track_dir = self.entry_dir(safe_key) / track
+        track_dir.mkdir(parents=True, exist_ok=True)
+        url_file = track_dir / "init.url"
+        mp4_file = track_dir / "init.mp4"
+        try:
+            old_url = url_file.read_text(encoding="utf-8").strip() if url_file.exists() else ""
+            if old_url != abs_map_url:
+                url_file.write_text(abs_map_url, encoding="utf-8")
+                if mp4_file.exists():
+                    mp4_file.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("write init.url failed %s/%s: %s", safe_key, track, exc)
+        return line[: m.start(1)] + f"/hls/{safe_key}/map/{track}" + line[m.end(1) :]
 
     # -- Media playlist -----------------------------------------------------
-    def rewrite_media(
-        self, safe_key: str, text: str, base_url: str, referer: str, playlist_url: str
+    def _rewrite_media_playlist(
+        self,
+        safe_key: str,
+        text: str,
+        base_url: str,
+        referer: str,
+        playlist_url: str,
+        track: str,
     ) -> str:
         out_lines: list[str] = []
         seg_urls: list[str] = []
@@ -380,6 +502,7 @@ class TransparentHlsCache:
         seg_duration = 0.0
         last_extinf = 0.0
         has_ext_key = False
+        seg_prefix = f"/hls/{safe_key}/aseg" if track == "a" else f"/hls/{safe_key}/seg"
 
         for raw_line in text.splitlines():
             line = raw_line.strip()
@@ -393,6 +516,8 @@ class TransparentHlsCache:
                         last_extinf = float(line[len("#EXTINF:") :].split(",")[0])
                     except ValueError:
                         last_extinf = 0.0
+                elif line.startswith("#EXT-X-MAP:"):
+                    raw_line = self._rewrite_map_line(line, base_url, safe_key, track)
                 elif line.startswith("#EXT-X-KEY:"):
                     attrs = _parse_attr_list(line[len("#EXT-X-KEY:") :])
                     if attrs.get("METHOD", "NONE").upper() != "NONE":
@@ -405,50 +530,64 @@ class TransparentHlsCache:
             seg_urls.append(abs_url)
             if seg_duration == 0.0:
                 seg_duration = last_extinf
-            out_lines.append(f"/hls/{safe_key}/seg/{idx}")
+            out_lines.append(f"{seg_prefix}/{idx}")
             idx += 1
 
         if has_ext_key:
             logger.warning(
-                "[hls][warn] %s has EXT-X-KEY (encryption); key URL left untouched — "
+                "[hls][warn] %s (%s) has EXT-X-KEY (encryption); key URL left untouched — "
                 "if playback fails the stream is DRM-protected",
                 safe_key,
+                track,
             )
 
         meta = self.read_meta(safe_key)
-        # 保留已有 cachedCount，重写 segments（URL 可能每次不同，idx 稳定）
-        meta.update(
-            {
-                "key": safe_key,
-                "safeKey": safe_key,
-                "mediaUrl": meta.get("mediaUrl") or playlist_url,
-                "referer": referer,
-                "mode": "transparent-hls",
-                "segmentDuration": seg_duration or meta.get("segmentDuration", 0),
-                "totalSegments": idx,
-                "status": "streaming",
-                "lastAccessAt": _now_iso(),
-            }
-        )
-        self.write_segments(safe_key, seg_urls)
-        # 只在首次建立时全量扫描；之后依赖 _touch_cached 增量维护
-        if meta.get("cachedCount") is None:
-            meta["cachedCount"] = sum(
-                1 for i in range(idx) if self.seg_path(safe_key, i).exists()
+        if track == "a":
+            self.write_audio_segments(safe_key, seg_urls)
+            meta.update(
+                {
+                    "key": safe_key,
+                    "safeKey": safe_key,
+                    "referer": meta.get("referer") or referer,
+                    "hasAudioTrack": True,
+                    "audioTotalSegments": idx,
+                    "lastAccessAt": _now_iso(),
+                }
             )
-        self.write_meta(safe_key, meta)
+            self.write_meta(safe_key, meta)
+            logger.info("[hls][audio] %s segments=%d dur/seg=%.2fs", safe_key, idx, seg_duration)
+        else:
+            # 保留已有 cachedCount，重写 segments（URL 可能每次不同，idx 稳定）
+            meta.update(
+                {
+                    "key": safe_key,
+                    "safeKey": safe_key,
+                    "mediaUrl": meta.get("mediaUrl") or playlist_url,
+                    "referer": referer,
+                    "mode": "transparent-hls",
+                    "segmentDuration": seg_duration or meta.get("segmentDuration", 0),
+                    "totalSegments": idx,
+                    "status": "streaming",
+                    "lastAccessAt": _now_iso(),
+                }
+            )
+            self.write_segments(safe_key, seg_urls)
+            if meta.get("cachedCount") is None:
+                meta["cachedCount"] = sum(
+                    1 for i in range(idx) if self.seg_path(safe_key, i).exists()
+                )
+            self.write_meta(safe_key, meta)
+            logger.info(
+                "[hls][media] %s segments=%d dur/seg=%.2fs cached=%d",
+                safe_key,
+                idx,
+                seg_duration,
+                meta["cachedCount"],
+            )
 
-        logger.info(
-            "[hls][media] %s segments=%d dur/seg=%.2fs cached=%d",
-            safe_key,
-            idx,
-            seg_duration,
-            meta["cachedCount"],
-        )
-
-        # 快照，排查用
+        # 快照，排查 / 字幕时长计算用
         try:
-            snap = self.entry_dir(safe_key) / "v"
+            snap = self.entry_dir(safe_key) / track
             snap.mkdir(parents=True, exist_ok=True)
             (snap / "0.m3u8").write_text(text, encoding="utf-8")
         except Exception:
@@ -456,16 +595,66 @@ class TransparentHlsCache:
 
         return "\n".join(out_lines) + "\n"
 
+    def rewrite_media(
+        self, safe_key: str, text: str, base_url: str, referer: str, playlist_url: str
+    ) -> str:
+        return self._rewrite_media_playlist(safe_key, text, base_url, referer, playlist_url, "v")
+
     def handle_variant(self, safe_key: str, variant_url: str, referer: str) -> str:
         if not referer:
             referer = str(self.read_meta(safe_key).get("referer") or "")
         text = self.fetch_text(variant_url, referer)
-        return self.rewrite_media(safe_key, text, variant_url, referer, variant_url)
+        return self._rewrite_media_playlist(safe_key, text, variant_url, referer, variant_url, "v")
+
+    def handle_audio_variant(self, safe_key: str, variant_url: str, referer: str) -> str:
+        if not referer:
+            referer = str(self.read_meta(safe_key).get("referer") or "")
+        text = self.fetch_text(variant_url, referer)
+        return self._rewrite_media_playlist(safe_key, text, variant_url, referer, variant_url, "a")
+
+    def get_init_map(self, safe_key: str, track: str) -> Optional[bytes]:
+        if track not in ("v", "a"):
+            return None
+        track_dir = self.entry_dir(safe_key) / track
+        mp4_file = track_dir / "init.mp4"
+        if mp4_file.exists() and mp4_file.stat().st_size > 0:
+            self._bump("hits")
+            try:
+                return mp4_file.read_bytes()
+            except OSError:
+                pass
+        url_file = track_dir / "init.url"
+        if not url_file.exists():
+            return None
+        map_url = url_file.read_text(encoding="utf-8").strip()
+        if not map_url:
+            return None
+        referer = str(self.read_meta(safe_key).get("referer") or "")
+        self._bump("misses")
+        data = self.fetch_bytes(map_url, referer)
+        if not data or _looks_like_html_error(data):
+            self._bump("errors")
+            raise RuntimeError(f"init map {track} looks invalid ({len(data)} bytes)")
+        track_dir.mkdir(parents=True, exist_ok=True)
+        tmp = mp4_file.with_suffix(".part")
+        try:
+            tmp.write_bytes(data)
+            tmp.replace(mp4_file)
+        except OSError as exc:
+            logger.warning("write init.mp4 failed %s/%s: %s", safe_key, track, exc)
+        self._bump("bytesServed", len(data))
+        return data
 
     # -- Segment ------------------------------------------------------------
-    def get_segment(self, safe_key: str, idx: int) -> Optional[bytes]:
-        path = self.seg_path(safe_key, idx)
-
+    def _get_track_segment(
+        self,
+        safe_key: str,
+        idx: int,
+        path: Path,
+        urls: list[str],
+        *,
+        is_audio: bool,
+    ) -> Optional[bytes]:
         if path.exists() and path.stat().st_size > config.HLS_SEGMENT_MIN_BYTES:
             self._bump("hits")
             try:
@@ -474,9 +663,8 @@ class TransparentHlsCache:
                 logger.warning("read cached segment failed %s#%d: %s", safe_key, idx, exc)
 
         meta = self.read_meta(safe_key)
-        urls = self.read_segments(safe_key)
         if idx < 0 or idx >= len(urls) or not urls[idx]:
-            logger.warning("[hls][miss] %s#%d not registered", safe_key, idx)
+            logger.warning("[hls][miss] %s#%d (%s) not registered", safe_key, idx, "a" if is_audio else "v")
             return None
 
         self._bump("misses")
@@ -496,8 +684,30 @@ class TransparentHlsCache:
             logger.warning("write segment failed %s#%d: %s", safe_key, idx, exc)
 
         self._bump("bytesServed", len(data))
-        self._touch_cached(safe_key, idx, len(data))
+        if is_audio:
+            meta["lastAccessAt"] = _now_iso()
+            self.write_meta(safe_key, meta)
+        else:
+            self._touch_cached(safe_key, idx, len(data))
         return data
+
+    def get_segment(self, safe_key: str, idx: int) -> Optional[bytes]:
+        return self._get_track_segment(
+            safe_key,
+            idx,
+            self.seg_path(safe_key, idx),
+            self.read_segments(safe_key),
+            is_audio=False,
+        )
+
+    def get_audio_segment(self, safe_key: str, idx: int) -> Optional[bytes]:
+        return self._get_track_segment(
+            safe_key,
+            idx,
+            self.audio_seg_path(safe_key, idx),
+            self.read_audio_segments(safe_key),
+            is_audio=True,
+        )
 
     def _touch_cached(self, safe_key: str, idx: int, size: int) -> None:
         meta = self.read_meta(safe_key)
@@ -508,39 +718,41 @@ class TransparentHlsCache:
         self.write_meta(safe_key, meta)
 
     # -- Prefetch -----------------------------------------------------------
-    def prefetch(self, safe_key: str, idx: int) -> None:
+    def _prefetch_track(self, safe_key: str, idx: int, *, is_audio: bool) -> None:
         ahead = config.HLS_PREFETCH_AHEAD
         if ahead <= 0:
             return
         meta = self.read_meta(safe_key)
-        total = int(meta.get("totalSegments") or 0)
+        total = int(meta.get("audioTotalSegments" if is_audio else "totalSegments") or 0)
         for n in range(idx + 1, idx + 1 + ahead):
             if total and n >= total:
                 break
-            if self.seg_path(safe_key, n).exists():
+            target_path = self.audio_seg_path(safe_key, n) if is_audio else self.seg_path(safe_key, n)
+            if target_path.exists():
                 continue
-            key = (safe_key, n)
+            key = ("a" if is_audio else "v", safe_key, n)
             with self._inflight_guard:
                 if key in self._inflight:
                     continue
                 self._inflight.add(key)
 
-            def worker(sk: str = safe_key, i: int = n) -> None:
+            def worker(sk: str = safe_key, i: int = n, audio_flag: bool = is_audio) -> None:
                 try:
-                    urls = self.read_segments(sk)
+                    urls = self.read_audio_segments(sk) if audio_flag else self.read_segments(sk)
                     if i < 0 or i >= len(urls) or not urls[i]:
                         return
                     data = self.fetch_bytes(urls[i], self.read_meta(sk).get("referer", ""))
                     if len(data) < config.HLS_SEGMENT_MIN_BYTES:
                         return
                     data = _strip_fake_image_header_if_ts(data)
-                    p = self.seg_path(sk, i)
+                    p = self.audio_seg_path(sk, i) if audio_flag else self.seg_path(sk, i)
                     p.parent.mkdir(parents=True, exist_ok=True)
                     tmp = p.with_suffix(".part")
                     tmp.write_bytes(data)
                     tmp.replace(p)
                     self._bump("prefetched")
-                    self._touch_cached(sk, i, len(data))
+                    if not audio_flag:
+                        self._touch_cached(sk, i, len(data))
                 except Exception:
                     pass
                 finally:
@@ -548,6 +760,12 @@ class TransparentHlsCache:
                         self._inflight.discard(key)
 
             self._prefetch_pool.submit(worker)
+
+    def prefetch(self, safe_key: str, idx: int) -> None:
+        self._prefetch_track(safe_key, idx, is_audio=False)
+
+    def prefetch_audio(self, safe_key: str, idx: int) -> None:
+        self._prefetch_track(safe_key, idx, is_audio=True)
 
     def scan_cached(self, safe_key: str) -> tuple[int, int]:
         """扫描磁盘，返回 (已缓存片数, 已缓存字节数)。
@@ -630,6 +848,7 @@ class TransparentHlsCache:
                 _move_aside(d)
 
         self._seg_cache.pop(safe_key, None)
+        self._audio_seg_cache.pop(safe_key, None)
         return not d.exists()
 
     def close(self) -> None:

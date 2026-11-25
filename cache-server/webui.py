@@ -23,6 +23,7 @@ import json
 import logging
 import math
 import re
+import tempfile
 import threading
 from pathlib import Path
 from typing import Any, Optional
@@ -45,6 +46,7 @@ hls_cache: Optional[TransparentHlsCache] = None
 router = APIRouter()
 
 _SEG_FILE_RE = re.compile(r"^(\d{6})\.ts$")
+_AUDIO_SEG_FILE_RE = re.compile(r"^(\d{6})\.seg$")
 
 
 def bind(cache: TransparentHlsCache) -> None:
@@ -131,16 +133,14 @@ def _segment_count(entry: Path) -> int:
     return len(_scan_segs(entry)[0])
 
 
-def _scan_segs(entry: Path) -> tuple[list[int], int]:
-    """一次遍历拿到 (已缓存分片下标, 已缓存字节数)，都以磁盘为准。"""
-    segs = entry / "segs"
-    if not segs.is_dir():
+def _scan_seg_dir(folder: Path, pattern: re.Pattern[str]) -> tuple[list[int], int]:
+    if not folder.is_dir():
         return [], 0
     idx: list[int] = []
     total = 0
     try:
-        for p in segs.iterdir():
-            m = _SEG_FILE_RE.match(p.name)
+        for p in folder.iterdir():
+            m = pattern.match(p.name)
             if not m:
                 continue
             try:
@@ -156,16 +156,21 @@ def _scan_segs(entry: Path) -> tuple[list[int], int]:
     return idx, total
 
 
+def _scan_segs(entry: Path) -> tuple[list[int], int]:
+    """一次遍历拿到 (已缓存视频分片下标, 已缓存字节数)，都以磁盘为准。"""
+    return _scan_seg_dir(entry / "segs", _SEG_FILE_RE)
+
+
+def _scan_audio_segs(entry: Path) -> tuple[list[int], int]:
+    """一次遍历拿到 (已缓存音频分片下标, 已缓存字节数)。"""
+    return _scan_seg_dir(entry / "asegs", _AUDIO_SEG_FILE_RE)
+
+
 def _cached_indices(entry: Path) -> list[int]:
     return _scan_segs(entry)[0]
 
 
-def _snapshot_durations(entry: Path) -> list[float]:
-    """从 v/0.m3u8 快照解析每个分片的 EXTINF 时长。
-
-    快照是改写前抓到的原始 playlist，EXTINF 与 segments.txt 的下标一一对应。
-    """
-    snap = entry / "v" / "0.m3u8"
+def _parse_m3u8_durations(snap: Path) -> list[float]:
     if not snap.exists():
         return []
     durs: list[float] = []
@@ -182,6 +187,11 @@ def _snapshot_durations(entry: Path) -> list[float]:
         except (ValueError, IndexError):
             durs.append(0.0)
     return durs
+
+
+def _snapshot_durations(entry: Path) -> list[float]:
+    """从 v/0.m3u8 快照解析每个分片的 EXTINF 时长。"""
+    return _parse_m3u8_durations(entry / "v" / "0.m3u8")
 
 
 def _ranges(indices: list[int]) -> list[list[int]]:
@@ -240,6 +250,7 @@ def _library_item(safe_key: str) -> Optional[dict[str, Any]]:
 
     total = int(meta.get("totalSegments") or 0)
     cached_idx, cached_bytes = _scan_segs(entry)
+    _, audio_bytes = _scan_audio_segs(entry)
     if not total:
         total = max(len(_cache().read_segments(safe_key)), (cached_idx[-1] + 1) if cached_idx else 0)
 
@@ -255,6 +266,7 @@ def _library_item(safe_key: str) -> Optional[dict[str, Any]]:
         cached_dur += durs[i] if i < len(durs) and durs[i] > 0 else fallback
 
     host, path = _split_key(safe_key)
+    has_audio = (entry / "a" / "0.m3u8").exists() or (entry / "audio_segments.txt").exists()
     return {
         "key": safe_key,
         "title": meta.get("title") or _pretty_title(host, path),
@@ -265,7 +277,7 @@ def _library_item(safe_key: str) -> Optional[dict[str, Any]]:
         "totalSegments": total,
         "cachedSegments": len(cached_idx),
         "cachedRanges": _ranges(cached_idx),
-        "cachedBytes": cached_bytes,
+        "cachedBytes": cached_bytes + audio_bytes,
         "durationSec": round(duration, 2),
         "cachedDurationSec": round(cached_dur, 2),
         "resolution": meta.get("resolution") or "",
@@ -273,6 +285,7 @@ def _library_item(safe_key: str) -> Optional[dict[str, Any]]:
         "lastAccessAt": meta.get("lastAccessAt") or "",
         "playable": bool(len(cached_idx)),
         "hasPrescan": (entry / "landmarks.bin").exists() and (entry / "landmarks.json").exists(),
+        "hasAudioTrack": has_audio,
     }
 
 
@@ -303,17 +316,26 @@ def list_library() -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # 本地播放列表
 # ---------------------------------------------------------------------------
-def build_playlist(safe_key: str, mode: str = "cached", start: int = 0) -> str:
+def build_media_playlist(safe_key: str, mode: str = "cached", start: int = 0, track: str = "v") -> str:
+    if track not in ("v", "a"):
+        raise ValueError(f"invalid track: {track}")
     entry = _entry(safe_key)
-    urls = _cache().read_segments(safe_key)
-    cached_idx = _cached_indices(entry)
     meta = _cache().read_meta(safe_key)
+    if track == "a":
+        urls = _cache().read_audio_segments(safe_key)
+        cached_idx, _ = _scan_audio_segs(entry)
+        durs = _parse_m3u8_durations(entry / "a" / "0.m3u8")
+        seg_route = "aseg"
+    else:
+        urls = _cache().read_segments(safe_key)
+        cached_idx = _cached_indices(entry)
+        durs = _snapshot_durations(entry)
+        seg_route = "seg"
 
     if not urls:
-        raise ValueError(f"{safe_key} has no segment index (play it once in the browser first)")
+        raise ValueError(f"{safe_key} has no {track} segment index (play it once in the browser first)")
 
     total = len(urls)
-    durs = _snapshot_durations(entry)
     fallback = float(meta.get("segmentDuration") or 0) or 5.0
 
     def dur_of(i: int) -> float:
@@ -323,29 +345,32 @@ def build_playlist(safe_key: str, mode: str = "cached", start: int = 0) -> str:
     if mode == "all":
         picked = list(range(max(0, start), total))
     else:
-        cached_set = set(cached_idx)
         picked = [i for i in cached_idx if i >= max(0, start)]
 
     if not picked:
-        raise ValueError(f"{safe_key} has no cached segments yet")
+        raise ValueError(f"{safe_key} has no cached {track} segments yet")
 
     durations = [dur_of(i) for i in picked]
     target = max(1, int(math.ceil(max(durations))))
+    has_map = (entry / track / "init.mp4").is_file() or (entry / track / "init.url").is_file()
 
     lines = [
         "#EXTM3U",
-        "#EXT-X-VERSION:3",
+        f"#EXT-X-VERSION:{6 if has_map else 3}",
         f"#EXT-X-TARGETDURATION:{target}",
         "#EXT-X-MEDIA-SEQUENCE:0",
         "#EXT-X-PLAYLIST-TYPE:VOD",
     ]
+    if has_map:
+        lines.append(f'#EXT-X-MAP:URI="/hls/{safe_key}/map/{track}"')
     for i, d in zip(picked, durations):
         lines.append(f"#EXTINF:{d:.6f},")
-        lines.append(f"/hls/{safe_key}/seg/{i}")
+        lines.append(f"/hls/{safe_key}/{seg_route}/{i}")
     lines.append("#EXT-X-ENDLIST")
 
     logger.info(
-        "[webui][playlist] %s mode=%s segments=%d (%d..%d) dur=%.1fs",
+        "[webui][playlist:%s] %s mode=%s segments=%d (%d..%d) dur=%.1fs",
+        track,
         safe_key,
         mode,
         len(picked),
@@ -354,6 +379,35 @@ def build_playlist(safe_key: str, mode: str = "cached", start: int = 0) -> str:
         sum(durations),
     )
     return "\n".join(lines) + "\n"
+
+
+def build_playlist(safe_key: str, mode: str = "cached", start: int = 0) -> str:
+    entry = _entry(safe_key)
+    has_audio = (entry / "a" / "0.m3u8").exists() or (entry / "audio_segments.txt").exists()
+    if has_audio:
+        audio_cached, _ = _scan_audio_segs(entry)
+        if mode == "all" or audio_cached:
+            meta = _cache().read_meta(safe_key)
+            bw = int(meta.get("bandwidth") or 2000000)
+            res = str(meta.get("resolution") or "").strip()
+            lines = [
+                "#EXTM3U",
+                "#EXT-X-VERSION:4",
+                f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,'
+                f'URI="/l/{safe_key}/audio.m3u8?mode={mode}&start={start}"',
+                f"#EXT-X-STREAM-INF:BANDWIDTH={bw}" + (f",RESOLUTION={res}" if res else "") + ',AUDIO="audio"',
+                f"/l/{safe_key}/video.m3u8?mode={mode}&start={start}",
+            ]
+            return "\n".join(lines) + "\n"
+    return build_media_playlist(safe_key, mode=mode, start=start, track="v")
+
+
+def _m3u8_res(body: str) -> Response:
+    return Response(
+        content=body.encode("utf-8"),
+        media_type="application/vnd.apple.mpegurl",
+        headers={"Cache-Control": "no-store", "Access-Control-Allow-Origin": "*"},
+    )
 
 
 @router.get("/l/{safe_key}/index.m3u8")
@@ -366,11 +420,33 @@ def local_playlist(
         body = build_playlist(safe_key, mode=mode, start=start)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return Response(
-        content=body.encode("utf-8"),
-        media_type="application/vnd.apple.mpegurl",
-        headers={"Cache-Control": "no-store", "Access-Control-Allow-Origin": "*"},
-    )
+    return _m3u8_res(body)
+
+
+@router.get("/l/{safe_key}/video.m3u8")
+def local_video_playlist(
+    safe_key: str,
+    mode: str = Query("cached"),
+    start: int = Query(0, ge=0),
+) -> Response:
+    try:
+        body = build_media_playlist(safe_key, mode=mode, start=start, track="v")
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return _m3u8_res(body)
+
+
+@router.get("/l/{safe_key}/audio.m3u8")
+def local_audio_playlist(
+    safe_key: str,
+    mode: str = Query("cached"),
+    start: int = Query(0, ge=0),
+) -> Response:
+    try:
+        body = build_media_playlist(safe_key, mode=mode, start=start, track="a")
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return _m3u8_res(body)
 
 
 @router.get("/api/library")
@@ -472,36 +548,50 @@ def _make_thumbnail(safe_key: str) -> Optional[Path]:
         if not idx:
             return None
         # 取缓存段的 1/3 处，避开片头黑场/台标
-        src = _entry(safe_key) / "segs" / f"{idx[len(idx) // 3]:06d}.ts"
+        entry = _entry(safe_key)
+        src = entry / "segs" / f"{idx[len(idx) // 3]:06d}.ts"
         if not src.exists():
-            src = _entry(safe_key) / "segs" / f"{idx[0]:06d}.ts"
+            src = entry / "segs" / f"{idx[0]:06d}.ts"
         if not src.exists():
             return None
+        init_mp4 = entry / "v" / "init.mp4"
+        temp_joined: Optional[Path] = None
+        ffmpeg_input = src
+        if init_mp4.is_file() and init_mp4.stat().st_size > 0:
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
+                temp_joined = Path(tf.name)
+                tf.write(init_mp4.read_bytes())
+                tf.write(src.read_bytes())
+            ffmpeg_input = temp_joined
         tmp = dest.with_suffix(".part.jpg")
-        for seek in ("2", "0"):  # 2 秒处抽帧，不行就退到片头
-            cmd = [
-                config.FFMPEG_PATH,
-                "-hide_banner",
-                "-loglevel", "error",
-                "-y",
-                "-ss", seek,
-                "-i", str(src),
-                "-frames:v", "1",
-                "-vf", "scale=480:-2",
-                "-q:v", "4",
-                str(tmp),
-            ]
-            try:
-                proc = __import__("subprocess").run(
-                    cmd, capture_output=True, timeout=25
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("thumb ffmpeg failed %s: %s", safe_key, exc)
-                continue
-            if proc.returncode == 0 and tmp.exists() and tmp.stat().st_size > 1024:
-                tmp.replace(dest)
-                return dest
-        return None
+        try:
+            for seek in ("2", "0"):  # 2 秒处抽帧，不行就退到片头
+                cmd = [
+                    config.FFMPEG_PATH,
+                    "-hide_banner",
+                    "-loglevel", "error",
+                    "-y",
+                    "-ss", seek,
+                    "-i", str(ffmpeg_input),
+                    "-frames:v", "1",
+                    "-vf", "scale=480:-2",
+                    "-q:v", "4",
+                    str(tmp),
+                ]
+                try:
+                    proc = __import__("subprocess").run(
+                        cmd, capture_output=True, timeout=25
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("thumb ffmpeg failed %s: %s", safe_key, exc)
+                    continue
+                if proc.returncode == 0 and tmp.exists() and tmp.stat().st_size > 1024:
+                    tmp.replace(dest)
+                    return dest
+            return None
+        finally:
+            if temp_joined is not None:
+                temp_joined.unlink(missing_ok=True)
     finally:
         _thumb_inflight.discard(safe_key)
         _thumb_lock.release()

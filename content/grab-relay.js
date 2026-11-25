@@ -25,6 +25,19 @@
   let lastPageUrl = null;
   let lastOnline = false;
   let lastCacheEnabled = false;
+  let lastRewritten = 0;
+
+  function safeKeyOf(urlStr) {
+    try {
+      const u = new URL(urlStr || window.location.href);
+      let path = u.pathname || "/";
+      if (path !== "/" && path.endsWith("/")) path = path.slice(0, -1);
+      const raw = (u.hostname.toLowerCase() + path).replace(/[^\w.\-/]/g, "_");
+      return raw.replace(/[^\w.\-]/g, "_").replace(/^[._]+/, "").replace(/[._]+$/, "");
+    } catch (_) {
+      return "";
+    }
+  }
 
   function canUseRuntime() {
     return typeof chrome !== "undefined" && chrome.runtime && typeof chrome.runtime.sendMessage === "function";
@@ -80,7 +93,7 @@
       chrome.runtime.sendMessage(
         {
           type: "rb-grab-init",
-          payload: { pageUrl: window.location.href },
+          payload: { pageUrl: window.location.href, cacheEnabled: lastCacheEnabled },
         },
         (res) => {
           if (chrome.runtime.lastError || !res) {
@@ -99,8 +112,22 @@
       chrome.storage.onChanged.addListener((changes, area) => {
         // 面板里切换「本站缓存」后立刻同步给 MAIN，不用刷新页面
         if (area === "local" && changes[CACHE_HOSTS_KEY]) {
+          const prevEnabled = lastCacheEnabled;
           lastCacheEnabled = resolveCacheEnabled(changes[CACHE_HOSTS_KEY].newValue);
           pushStateToMain(null, null, null);
+          if (!prevEnabled && lastCacheEnabled && !lastOnline && canUseRuntime()) {
+            try {
+              chrome.runtime.sendMessage(
+                { type: "rb-ensure-server", payload: { reason: "cache-toggle" } },
+                (res) => {
+                  if (chrome.runtime.lastError) return;
+                  if (res && res.serverOnline) {
+                    pushStateToMain(null, null, true);
+                  }
+                }
+              );
+            } catch (_) {}
+          }
           return;
         }
         if (area !== "session") return;
@@ -117,12 +144,38 @@
     const data = event.data;
     if (!data || typeof data !== "object") return;
 
+    if (data.__rbGrabStats === true) {
+      if (typeof data.rewritten === "number") lastRewritten = data.rewritten;
+      return;
+    }
+
     if (data.__rbGrab === "request-sync") {
       readCachePref(() => requestInitFromSw());
       return;
     }
   });
 
-  // 先读缓存开关，再拉 SW 状态：保证第一次同步就带正确的 cacheEnabled
-  readCachePref(() => requestInitFromSw());
+  window.__RB_CACHE_RELAY__ = {
+    getPageKey: () => lastPageKey,
+    getSafeKey: () => safeKeyOf(lastPageUrl || window.location.href),
+    isServerOnline: () => lastOnline,
+    isCacheEnabled: () => lastCacheEnabled,
+    getRewrittenCount: () => lastRewritten,
+  };
+
+  // 先读缓存开关和 session 缓存的在线态立即同步给 MAIN，再向 SW 请求权威状态
+  readCachePref(() => {
+    try {
+      if (typeof chrome !== "undefined" && chrome.storage && chrome.storage.session) {
+        chrome.storage.session.get({ rbServerOnline: false }, (sres) => {
+          if (!chrome.runtime.lastError && sres && typeof sres.rbServerOnline === "boolean") {
+            pushStateToMain(null, null, sres.rbServerOnline);
+          }
+          requestInitFromSw();
+        });
+        return;
+      }
+    } catch (_) {}
+    requestInitFromSw();
+  });
 })();

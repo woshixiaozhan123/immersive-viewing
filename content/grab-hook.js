@@ -41,15 +41,14 @@
   // =========================================================================
   function applySyncState(state) {
     if (!state || typeof state !== "object") return;
+    const wasReady = serverOnline && cacheEnabled;
     if (typeof state.pageKey === "string" && state.pageKey) pageKey = state.pageKey;
     if (typeof state.pageUrl === "string" && state.pageUrl) pageUrl = state.pageUrl;
     if (typeof state.serverOnline === "boolean") serverOnline = state.serverOnline;
-    if (typeof state.cacheEnabled === "boolean") {
-      const wasOff = !cacheEnabled;
-      cacheEnabled = state.cacheEnabled;
-      // 用户中途打开开关：把正在播的 hls.js 实例热切到本地代理，不用刷新页面
-      if (wasOff && cacheEnabled) reapplyLivePlayers();
-    }
+    if (typeof state.cacheEnabled === "boolean") cacheEnabled = state.cacheEnabled;
+    const isReady = serverOnline && cacheEnabled;
+    // 用户中途打开开关或本地服务刚唤醒：把正在播的 hls.js 实例热切到本地代理，不用刷新页面
+    if (!wasReady && isReady) reapplyLivePlayers();
   }
 
   try {
@@ -96,6 +95,20 @@
   // =========================================================================
   // 改写：媒体 URL -> 本地 m3u8 代理
   // =========================================================================
+  function shouldInterceptM3u8Url(rawUrl) {
+    if (!rawUrl || typeof rawUrl !== "string") return "";
+    if (isLocal(rawUrl) || !M3U8_RE.test(rawUrl)) return "";
+    try {
+      const u = new URL(rawUrl, window.location.href);
+      if (u.protocol !== "http:" && u.protocol !== "https:") return "";
+      const lower = (u.pathname || "").toLowerCase();
+      if (/(?:subtitle|caption|webvtt|vtt|thumb|sprite)/.test(lower)) return "";
+      return u.href;
+    } catch (_) {
+      return "";
+    }
+  }
+
   function toLocalPlaylist(mediaUrl) {
     if (!serverOnline) {
       STATS.skippedOffline += 1;
@@ -112,6 +125,9 @@
     if (!src) return mediaUrl;
     const ref = b64e(window.location.href);
     STATS.rewritten += 1;
+    try {
+      window.postMessage({ __rbGrabStats: true, rewritten: STATS.rewritten }, "*");
+    } catch (_) {}
     const local = `${LOCAL_ORIGIN}/hls/${encodeURIComponent(sk)}/master.m3u8?src=${src}&ref=${ref}`;
     try {
       console.log("[rb-hls][rewrite]", mediaUrl, "->", local);
@@ -224,6 +240,64 @@
         return videoSrcDesc.set.call(this, next);
       },
     });
+  }
+
+  // =========================================================================
+  // Hook 3: XMLHttpRequest.open（拦截打包进闭包的 hls.js / 自研播放器）
+  // =========================================================================
+  const origXhrOpen = XMLHttpRequest.prototype.open;
+  if (typeof origXhrOpen === "function") {
+    XMLHttpRequest.prototype.open = function (method, url) {
+      const args = Array.prototype.slice.call(arguments);
+      try {
+        if (
+          cacheEnabled &&
+          serverOnline &&
+          String(method || "GET").toUpperCase() === "GET" &&
+          typeof url === "string"
+        ) {
+          const abs = shouldInterceptM3u8Url(url);
+          if (abs) {
+            args[1] = toLocalPlaylist(abs);
+          }
+        }
+      } catch (_) {}
+      return origXhrOpen.apply(this, args);
+    };
+  }
+
+  // =========================================================================
+  // Hook 4: window.fetch（拦截基于 fetch 的现代 HLS 播放器）
+  // =========================================================================
+  const origFetch = window.fetch;
+  if (typeof origFetch === "function") {
+    window.fetch = function (input, init) {
+      let nextInput = input;
+      try {
+        if (cacheEnabled && serverOnline) {
+          const reqMethod = String(
+            (init && init.method) || (input && typeof input === "object" && input.method) || "GET"
+          ).toUpperCase();
+          if (reqMethod === "GET") {
+            if (typeof input === "string" || input instanceof URL) {
+              const abs = shouldInterceptM3u8Url(String(input));
+              if (abs) nextInput = toLocalPlaylist(abs);
+            } else if (typeof Request !== "undefined" && input instanceof Request) {
+              const abs = shouldInterceptM3u8Url(input.url);
+              if (abs) {
+                const rewritten = toLocalPlaylist(abs);
+                if (rewritten && rewritten !== abs) {
+                  nextInput = new Request(rewritten, input);
+                }
+              }
+            }
+          }
+        }
+      } catch (_) {
+        nextInput = input;
+      }
+      return origFetch.call(this, nextInput, init);
+    };
   }
 
   // =========================================================================
