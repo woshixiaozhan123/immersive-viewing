@@ -28,6 +28,8 @@
       '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/></svg>',
     exitFull:
       '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z"/></svg>',
+    pip:
+      '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 7h-8v6h8V7zm2-4H3c-1.1 0-2 .9-2 2v14c0 1.1.9 1.98 2 1.98h18c1.1 0 2-.88 2-1.98V5c0-1.1-.9-2-2-2zm0 16.01H3V4.98h18v14.03z"/></svg>',
   };
 
   const CSS = `
@@ -43,6 +45,7 @@
   transition:background .15s}
 .rbp-btn:hover{background:rgba(255,255,255,.16)}
 .rbp-btn svg{width:20px;height:20px;fill:#fff;display:block}
+.rbp-btn[data-active="1"] svg{fill:#ff4d8d}
 .rbp-time{flex:0 0 auto;min-width:44px;text-align:center;color:#d8deea;letter-spacing:.2px}
 .rbp-seek{-webkit-appearance:none;appearance:none;flex:1 1 auto;min-width:0;height:4px;border-radius:99px;
   background:rgba(255,255,255,.26);outline:none;cursor:pointer;margin:0 2px;
@@ -225,12 +228,14 @@
           <option value="1.5">1.5x</option>
           <option value="2">2x</option>
         </select>
+        <button class="rbp-btn" data-act="pip" title="美颜小窗（置顶保留美颜与字幕）">${ICON.pip}</button>
         <button class="rbp-btn" data-act="full" title="全屏 (F)">${ICON.full}</button>
       </div>`;
     container.appendChild(root);
 
     const btnToggle = root.querySelector('[data-act="toggle"]');
     const btnMute = root.querySelector('[data-act="mute"]');
+    const btnPip = root.querySelector('[data-act="pip"]');
     const btnFull = root.querySelector('[data-act="full"]');
     const seek = root.querySelector(".rbp-seek");
     const curEl = root.querySelector('[data-role="cur"]');
@@ -289,6 +294,33 @@
       syncMuteIcon();
     });
 
+    function resolvePipApi() {
+      if (window.RBPip) return window.RBPip;
+      try {
+        if (window.top && window.top.RBPip) return window.top.RBPip;
+      } catch (_) {}
+      return null;
+    }
+
+    function syncPipIcon() {
+      if (!btnPip) return;
+      const pip = resolvePipApi();
+      const active = pip ? pip.isOpen() : document.pictureInPictureElement === video;
+      btnPip.setAttribute("data-active", active ? "1" : "0");
+    }
+
+    on(btnPip, "click", () => {
+      const pip = resolvePipApi();
+      if (pip) {
+        void pip.toggle(video);
+      } else if (document.pictureInPictureElement === video) {
+        document.exitPictureInPicture().catch(() => {});
+      } else if (typeof video.requestPictureInPicture === "function") {
+        video.requestPictureInPicture().catch(() => {});
+      }
+      poke();
+    });
+
     on(btnFull, "click", () => {
       // 不能对 <video> 全屏：engine 在 fullscreenElement === video 时会 hideCanvas，
       // 美颜直接消失。请求容器全屏可以保住 canvas。
@@ -340,13 +372,19 @@
     });
 
     on(document, "fullscreenchange", syncFullIcon);
+    on(video, "enterpictureinpicture", syncPipIcon);
+    on(video, "leavepictureinpicture", syncPipIcon);
     on(container, "mousemove", poke, { passive: true });
     on(container, "mouseleave", () => {
       if (!video.paused) root.setAttribute("data-hidden", "1");
     });
 
+    const pipApi = resolvePipApi();
+    const unsubPip = pipApi && typeof pipApi.subscribe === "function" ? pipApi.subscribe(syncPipIcon) : () => {};
+
     syncPlayIcon();
     syncMuteIcon();
+    syncPipIcon();
     syncSeek();
     poke();
 
@@ -360,6 +398,9 @@
           } catch (_) {}
         }
         bound.length = 0;
+        try {
+          unsubPip();
+        } catch (_) {}
         if (hideTimer) clearTimeout(hideTimer);
       },
     };

@@ -797,6 +797,10 @@
               <span class="slider"></span>
             </label>
           </div>
+          <div class="row-between" id="pipRow" style="margin-top:9px">
+            <span class="label">美颜小窗 <span id="pipModeHint" class="hint-muted">置顶保留美颜与字幕</span></span>
+            <button id="btnTogglePip" class="pill" type="button" style="padding:4px 10px" title="弹出置顶独立小窗（保留美颜与中文字幕）">打开小窗</button>
+          </div>
           <div class="row-between" style="margin-top:9px">
             <label class="label" for="subtitleMode">本地字幕</label>
             <select id="subtitleMode" class="select" style="width:auto;margin:0" disabled>
@@ -958,6 +962,9 @@
       barToggleRow: $("barToggleRow"),
       togglePlayerBar: $("togglePlayerBar"),
       barHostHint: $("barHostHint"),
+      pipRow: $("pipRow"),
+      btnTogglePip: $("btnTogglePip"),
+      pipModeHint: $("pipModeHint"),
       cacheToggleRow: $("cacheToggleRow"),
       toggleSiteCache: $("toggleSiteCache"),
       cacheHostHint: $("cacheHostHint"),
@@ -1408,6 +1415,47 @@
           clearInterval(timer);
         }
       }, 500);
+    })();
+
+    (function setupPipControl() {
+      const btn = els.btnTogglePip;
+      const hint = els.pipModeHint;
+      if (!btn || !els.pipRow) return;
+      const modeNames = {
+        document: "置顶美颜+字幕",
+        composite: "合成画中画",
+        native: "原生画中画",
+      };
+      const syncPip = () => {
+        const pip = window.RBPip;
+        if (!pip) {
+          btn.disabled = true;
+          btn.textContent = "需刷新页";
+          if (hint) hint.textContent = "刷新后可用";
+          return;
+        }
+        btn.disabled = false;
+        const open = pip.isOpen();
+        const m = pip.getMode();
+        btn.textContent = open ? "关闭小窗" : "打开小窗";
+        btn.classList.toggle("active", open);
+        if (hint) hint.textContent = open ? modeNames[m] || "运行中" : "置顶保留美颜与字幕";
+      };
+      btn.addEventListener("click", () => {
+        const pip = window.RBPip;
+        if (!pip) return;
+        const target = window.__WVB_ENGINE__?.video || window.RBPlayerBar?.pickMainVideo?.(true) || null;
+        void Promise.resolve(pip.toggle(target)).then((opened) => {
+          if (!opened && !pip.isOpen() && hint) {
+            hint.textContent = "未检测到可播放视频";
+            setTimeout(syncPip, 2000);
+          } else {
+            syncPip();
+          }
+        });
+      });
+      if (window.RBPip?.subscribe) window.RBPip.subscribe(syncPip);
+      syncPip();
     })();
 
     const subtitleMode = $("subtitleMode");

@@ -1,6 +1,6 @@
 {
   "name": "immersive-viewing",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "private": true,
   "type": "module",
   "description": "沉浸式观影 — 本机离线网页视频增强 Chromium MV3 扩展（26 项实时美颜 + 离线 AI 中文字幕 + 本地透明缓存 + 自制控制条）。",

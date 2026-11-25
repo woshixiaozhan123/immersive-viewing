@@ -4,6 +4,17 @@
 
 ---
 
+## [1.3.0] - 2026-11-25
+
+### 新增（Added）
+- **独立置顶美颜小窗（美颜 + 离线 AI 翻译字幕全保留）**：
+  - [content/pip.js](content/pip.js)：首选 Chromium Document Picture-in-Picture 在独立置顶小窗内实时镜像 WebGL 美颜画布（美颜关闭时无缝切回原画面）并渲染中文字幕 / 双语字幕（继承字号与高度配置，随窗口自适应缩放），附带悬停迷你控制条（播放/暂停、进度拖拽、静音、倍速、小窗内开关美颜与切换字幕模式、一键回原页及快捷键）。
+  - **后台切页保活**：小窗打开期间切换到其他标签页时，[content/engine.js](content/engine.js) 切换为小窗 `requestAnimationFrame` 驱动循环，[content/subtitles.js](content/subtitles.js) 同步保持离线转写翻译拉取与渲染，关闭小窗后立即恢复原有节能停顿。
+  - **自动降级与原生画中画字幕兜底**：不支持 Document Picture-in-Picture 的环境自动降级为离屏 2D 合成画布 + `captureStream(30)` 代理画中画；遇到严格跨域画布限制再优雅回退原生 `requestPictureInPicture()`，并由 [content/subtitles.js](content/subtitles.js) 自动挂载 `VTTCue` 原生字幕轨道兜底。
+  - **全入口接入**：自制播放控制条（[content/player-bar.js](content/player-bar.js)）、悬浮美颜面板（[content/overlay-ui.js](content/overlay-ui.js)）及本地媒体库内置播放器（[cache-server/web/player.html](cache-server/web/player.html)，支持 `P` 键快捷开关）均已接入。
+
+---
+
 ## [1.2.0] - 2026-11-25
 
 ### 新增（Added）

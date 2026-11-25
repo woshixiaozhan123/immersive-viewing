@@ -19,7 +19,7 @@ chrome.action.onClicked.addListener(async (tab) => {
     await chrome.scripting.executeScript({
       target: { tabId },
       // player-bar 必须排在最前：overlay 面板要读 window.RBPlayerBar 才能显示控制条开关
-      files: ["content/player-bar.js", "content/subtitles.js", "content/engine.js", "content/overlay-ui.js"],
+      files: ["content/player-bar.js", "content/subtitles.js", "content/engine.js", "content/pip.js", "content/overlay-ui.js"],
     });
     await chrome.tabs.sendMessage(tabId, { type: "WVB_OPEN_PANEL" });
   } catch (_) {

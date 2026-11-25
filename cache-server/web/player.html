@@ -41,6 +41,7 @@
 <script src="/static/player-bar.js"></script>
 <script src="/static/subtitles.js"></script>
 <script src="/static/engine.js"></script>
+<script src="/static/pip.js"></script>
 <script src="/static/overlay-ui.js"></script>
 
 <script>
@@ -327,6 +328,8 @@
       else st.requestFullscreen().catch(() => {});
     } else if (k === "m") {
       video.muted = !video.muted;
+    } else if (k === "p") {
+      window.RBPip?.toggle(video);
     }
   });
 

@@ -77,6 +77,7 @@ _MIME = {
 
 _STATIC_EXACT = {
     "engine.js": PROJECT_ROOT / "content" / "engine.js",
+    "pip.js": PROJECT_ROOT / "content" / "pip.js",
     "overlay-ui.js": PROJECT_ROOT / "content" / "overlay-ui.js",
     "player-bar.js": PROJECT_ROOT / "content" / "player-bar.js",
     "subtitles.js": PROJECT_ROOT / "content" / "subtitles.js",

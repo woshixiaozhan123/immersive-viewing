@@ -34,7 +34,19 @@
   let primary, secondary, status;
   let nativeTrack = null;
   let nativeCue = null;
+  let pipSink = null;
   const listeners = new Set();
+
+  function isPipOpen() {
+    return (
+      !!(pipSink && typeof pipSink.isOpen === "function" && pipSink.isOpen()) ||
+      !!(video && document.pictureInPictureElement === video)
+    );
+  }
+
+  function isHidden() {
+    return document.hidden && !isPipOpen();
+  }
 
   function notify() {
     for (const listener of listeners) listener();
@@ -171,6 +183,11 @@
     requestedAt = null;
     if (frame) frame.hidden = true;
     removeNativeCue();
+    if (pipSink && typeof pipSink.isOpen === "function" && pipSink.isOpen()) {
+      try {
+        pipSink.onRender({ text: "", src: "", hint: "", style: { ...subStyle }, mode, active: false });
+      } catch (_) {}
+    }
   }
 
   function removeNativeCue() {
@@ -209,10 +226,15 @@
     on("emptied", () => { deactivate(); clear(); });
     on("play", () => { void tick(); });
     on("timeupdate", render);
+    on("enterpictureinpicture", () => { void tick(); render(); });
+    on("leavepictureinpicture", () => {
+      if (isHidden()) deactivate();
+      render();
+    });
   }
 
   async function tick() {
-    if (mode === "off" || document.hidden || (local && !window.__RB_SUBS_TIMELINE_READY__)) return;
+    if (mode === "off" || isHidden() || (local && !window.__RB_SUBS_TIMELINE_READY__)) return;
     if (pageUrl !== location.href) {
       pageUrl = location.href;
       deactivate();
@@ -229,7 +251,7 @@
     try {
       task = request({ session, time: point.time, until: point.until, seek: initial, active: true, profile });
       const data = await task;
-      if (rev !== generation || mode === "off" || document.hidden) return;
+      if (rev !== generation || mode === "off" || isHidden()) return;
       requestedAt = point.time;
       state = data?.state || "offline";
       cues = Array.isArray(data?.cues) ? data.cues : [];
@@ -240,7 +262,7 @@
       render();
     } finally {
       task = null;
-      if (priority && rev !== generation && !document.hidden) void tick();
+      if (priority && rev !== generation && !isHidden()) void tick();
     }
   }
 
@@ -308,9 +330,14 @@
   }
 
   function render() {
-    if (!video || mode === "off" || document.hidden || video.seeking) {
+    if (!video || mode === "off" || isHidden() || video.seeking) {
       if (frame) frame.hidden = true;
       removeNativeCue();
+      if (pipSink && typeof pipSink.isOpen === "function" && pipSink.isOpen()) {
+        try {
+          pipSink.onRender({ text: "", src: "", hint: "", style: { ...subStyle }, mode, active: false });
+        } catch (_) {}
+      }
       return;
     }
     const point = locationOnTimeline(video.currentTime);
@@ -331,8 +358,15 @@
     }
     const messages = { queued: "正在生成字幕", uncached: uncachedMsg, offline: "请启动本地缓存服务", error: "字幕生成遇到问题" };
     const hint = !text && recent && !video.ended ? messages[state] || "" : "";
+    const customPip = !!(pipSink && typeof pipSink.isOpen === "function" && pipSink.isOpen());
+    if (customPip) {
+      try {
+        pipSink.onRender({ text, src, hint, style: { ...subStyle }, mode, active: true });
+      } catch (_) {}
+    }
     const full = document.fullscreenElement || document.webkitFullscreenElement;
-    if (full === video || video.webkitDisplayingFullscreen) {
+    const inNativePip = document.pictureInPictureElement === video;
+    if (!customPip && (full === video || video.webkitDisplayingFullscreen || inNativePip)) {
       if (frame) frame.hidden = true;
       showNative(cue, src ? src + "\n" + text : text, point.offset);
       return;
@@ -373,6 +407,19 @@
     setProfile,
     style: () => ({ ...subStyle }),
     setStyle,
+    render,
+    setPipSink(sink) {
+      pipSink = sink || null;
+      if (pipSink && mode !== "off") {
+        void tick();
+        render();
+      } else if (!pipSink && isHidden()) {
+        deactivate();
+        render();
+      } else {
+        render();
+      }
+    },
     subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
   };
   document.addEventListener("fullscreenchange", render);
@@ -380,7 +427,7 @@
   window.addEventListener("resize", render, { passive: true });
   window.addEventListener("scroll", render, { passive: true, capture: true });
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) { deactivate(); render(); }
+    if (isHidden()) { deactivate(); render(); }
     else void tick();
   });
   window.addEventListener("pagehide", deactivate);

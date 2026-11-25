@@ -758,6 +758,15 @@
       this.boundDocCleanup = [];
       this.destroyed = false;
 
+      // Picture-in-Picture sync & background driver state
+      this.pipActive = false;
+      this.pipFrameCallback = null;
+      this.pipDriverWindow = null;
+      this.pipRafHandle = null;
+      this.pipLastMediaTime = -1;
+      this.pipLastPushMs = 0;
+      this.engineChangeListeners = new Set();
+
       // Performance & degradation
       this.degradeTier = "L0";
       this.renderTimes = [];
@@ -806,7 +815,18 @@
       document.addEventListener("visibilitychange", () => {
         if (this.destroyed) return;
         if (document.visibilityState === "hidden") {
-          this.stopFrameLoop();
+          if (
+            this.pipActive &&
+            this.enabled &&
+            this.captureStatus === "ready" &&
+            this.video &&
+            !this.video.paused &&
+            !this.video.ended
+          ) {
+            this.startFrameLoop();
+          } else {
+            this.stopFrameLoop();
+          }
         } else if (
           this.enabled &&
           this.captureStatus === "ready" &&
@@ -1192,6 +1212,7 @@
           if (!this.video.paused && !this.video.ended) {
             this.startFrameLoop();
           }
+          this.emitChange();
         } else {
           this.probeFrameCaptureOnly();
           this.captureStatus = "ready";
@@ -1199,6 +1220,7 @@
           this.lastError = "";
           this.probeAttempts = 0;
           this.renderMode = "off";
+          this.emitChange();
         }
       } catch (err) {
         const name = err && err.name ? err.name : "";
@@ -1624,8 +1646,17 @@
       const dpr = Math.min(win.devicePixelRatio || 1, 1.5);
       const maxW = this.degradeTier === "L2" ? 1280 : 1920;
       const maxH = this.degradeTier === "L2" ? 720 : 1080;
-      const targetW = Math.max(2, Math.min(Math.round(cssW * safeScaleX * dpr), this.video.videoWidth || maxW, maxW));
-      const targetH = Math.max(2, Math.min(Math.round(cssH * safeScaleY * dpr), this.video.videoHeight || maxH, maxH));
+      let targetW = Math.max(2, Math.min(Math.round(cssW * safeScaleX * dpr), this.video.videoWidth || maxW, maxW));
+      let targetH = Math.max(2, Math.min(Math.round(cssH * safeScaleY * dpr), this.video.videoHeight || maxH, maxH));
+      if (this.pipActive && this.video.videoWidth > 0 && this.video.videoHeight > 0) {
+        const vw = this.video.videoWidth;
+        const vh = this.video.videoHeight;
+        if (cssW * safeScaleX < 320 || cssH * safeScaleY < 180) {
+          const scale = Math.min(1, 960 / vw, 540 / vh);
+          targetW = Math.max(targetW, Math.min(maxW, Math.max(2, Math.round(vw * scale))));
+          targetH = Math.max(targetH, Math.min(maxH, Math.max(2, Math.round(vh * scale))));
+        }
+      }
 
       if (this.canvas.width !== targetW || this.canvas.height !== targetH) {
         this.canvas.width = targetW;
@@ -2608,6 +2639,11 @@
       gl.bindTexture(gl.TEXTURE_2D, this.hairTex);
 
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      if (this.pipFrameCallback && this.canvas) {
+        try {
+          this.pipFrameCallback(this.canvas, this.video);
+        } catch (_) {}
+      }
       this.renderMode = hasFaceMask ? "face_mask" : "skin_fallback";
       this.recordPerformance(performance.now() - t0, nowMs);
     }
@@ -2713,6 +2749,40 @@
       this.stopFrameLoop();
       if (!this.video || !this.enabled || this.captureStatus !== "ready") return;
 
+      if (
+        this.pipActive &&
+        this.pipDriverWindow &&
+        !this.pipDriverWindow.closed &&
+        document.visibilityState === "hidden" &&
+        typeof this.pipDriverWindow.requestAnimationFrame === "function"
+      ) {
+        const pipTick = (now) => {
+          this.pipRafHandle = null;
+          if (
+            !this.enabled ||
+            !this.video ||
+            this.video.paused ||
+            this.video.ended ||
+            !this.pipActive ||
+            !this.pipDriverWindow ||
+            this.pipDriverWindow.closed
+          ) {
+            return;
+          }
+          const mt = this.video.currentTime;
+          if (mt !== this.pipLastMediaTime || now - this.pipLastPushMs >= 80) {
+            this.pipLastMediaTime = mt;
+            this.pipLastPushMs = now;
+            this.renderSingleFrame(now);
+          }
+          if (this.pipActive && this.pipDriverWindow && !this.pipDriverWindow.closed && !this.video.paused && !this.video.ended) {
+            this.pipRafHandle = this.pipDriverWindow.requestAnimationFrame(pipTick);
+          }
+        };
+        this.pipRafHandle = this.pipDriverWindow.requestAnimationFrame(pipTick);
+        return;
+      }
+
       if (typeof this.video.requestVideoFrameCallback === "function") {
         const onFrame = (now) => {
           this.rvfcHandle = null;
@@ -2733,6 +2803,18 @@
     }
 
     stopFrameLoop() {
+      if (this.pipRafHandle !== null) {
+        try {
+          if (
+            this.pipDriverWindow &&
+            !this.pipDriverWindow.closed &&
+            typeof this.pipDriverWindow.cancelAnimationFrame === "function"
+          ) {
+            this.pipDriverWindow.cancelAnimationFrame(this.pipRafHandle);
+          }
+        } catch (_) {}
+        this.pipRafHandle = null;
+      }
       if (this.rvfcHandle !== null && this.video && typeof this.video.cancelVideoFrameCallback === "function") {
         this.video.cancelVideoFrameCallback(this.rvfcHandle);
       }
@@ -2751,11 +2833,61 @@
       if (this.canvas) this.canvas.style.setProperty("display", "none", "important");
     }
 
+    emitChange() {
+      for (const fn of this.engineChangeListeners) {
+        try {
+          fn(this);
+        } catch (_) {}
+      }
+    }
+
+    subscribeChange(fn) {
+      if (typeof fn !== "function") return () => {};
+      this.engineChangeListeners.add(fn);
+      return () => this.engineChangeListeners.delete(fn);
+    }
+
+    setPipSink(opts) {
+      if (!opts) {
+        this.pipActive = false;
+        this.pipFrameCallback = null;
+        this.pipDriverWindow = null;
+        this.pipLastMediaTime = -1;
+        this.pipLastPushMs = 0;
+        if (document.visibilityState === "hidden") {
+          this.stopFrameLoop();
+        } else if (
+          this.enabled &&
+          this.captureStatus === "ready" &&
+          this.video &&
+          !this.video.paused &&
+          !this.video.ended
+        ) {
+          this.startFrameLoop();
+        }
+        this.syncCanvasGeometry();
+        return;
+      }
+      this.pipActive = true;
+      this.pipFrameCallback = typeof opts.onFrame === "function" ? opts.onFrame : null;
+      this.pipDriverWindow = opts.driverWindow || null;
+      this.pipLastMediaTime = -1;
+      this.pipLastPushMs = 0;
+      if (this.enabled && this.captureStatus === "ready" && this.video) {
+        this.syncCanvasGeometry();
+        this.renderSingleFrame(performance.now(), { skipInfer: true, forceUpload: !this.hasCommittedFrame });
+        if (!this.video.paused && !this.video.ended) {
+          this.startFrameLoop();
+        }
+      }
+    }
+
     stopBeautyOverlay(errorMessage) {
       this.stopFrameLoop();
       this.hideCanvas();
       this.renderMode = this.enabled && errorMessage ? "native_fallback" : "off";
       if (errorMessage) this.lastError = errorMessage;
+      this.emitChange();
     }
 
     setEnabled(enabled) {
@@ -2765,6 +2897,7 @@
       if (!this.enabled) {
         this.stopBeautyOverlay("");
         this.terminateWorker(false);
+        this.emitChange();
         return;
       }
       this.workerUnavailable = false;
@@ -2774,6 +2907,7 @@
         this.probeAttempts = 0;
         this.runProtectionAndProbe();
       }
+      this.emitChange();
     }
 
     setBeautyParams(partial) {
@@ -2799,6 +2933,7 @@
       if (this.enabled && this.captureStatus === "ready") {
         this.renderSingleFrame(performance.now(), { skipInfer: true });
       }
+      this.emitChange();
     }
 
     setDebugMask(flag) {

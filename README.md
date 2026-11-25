@@ -53,7 +53,7 @@ flowchart LR
 ## 快速安装（桌面端 Chromium 浏览器）
 
 ### 方式一：直接下载 Release 预构建包（推荐普通用户）
-1. 前往 [Releases 页面](https://github.com/woshixiaozhan123/immersive-viewing/releases) 下载 `immersive-viewing-v1.2.0.zip` 并解压（内含全部离线美颜模型与本地字幕/缓存服务脚本，无需安装 Git）。
+1. 前往 [Releases 页面](https://github.com/woshixiaozhan123/immersive-viewing/releases) 下载 `immersive-viewing-v1.3.0.zip` 并解压（内含全部离线美颜模型与本地字幕/缓存服务脚本，无需安装 Git）。
 2. 打开浏览器扩展管理页：
    - Chrome：`chrome://extensions`
    - Edge：`edge://extensions`

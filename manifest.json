@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "沉浸式观影",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "沉浸式观影 — 本机离线网页视频增强扩展，集 26 项 WebGL + MediaPipe 478 点实时美颜、本地 AI 离线中文字幕翻译、透明视频缓存与自制播放器控制条于一体。",
   "icons": {
     "16": "icons/icon16.png",
@@ -99,6 +99,7 @@
       ],
       "js": [
         "content/engine.js",
+        "content/pip.js",
         "content/overlay-ui.js"
       ],
       "run_at": "document_idle",
