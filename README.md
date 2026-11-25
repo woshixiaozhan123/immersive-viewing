@@ -1,6 +1,6 @@
-# 实时美颜（桌面 Chromium MV3 + iOS Safari）
+# 沉浸式观影（桌面 Chromium MV3 + iOS Safari）
 
-> 本机实时网页视频美颜方案 —— **WebGL 单 Pass 26 项美颜/微整形 + MediaPipe 478 点人脸追踪**，无需服务器、不上传任何视频帧，桌面扩展零后台常驻开销，同时提供支持 **剧场全屏 + 一键 90° 横屏** 的 iOS Safari 用户脚本。
+> 本机离线网页视频增强套件 —— 集 **WebGL 单 Pass 26 项实时美颜（MediaPipe 478 点 + 发丝分割）**、**本地 AI 离线中文字幕翻译（Whisper + 混元 Hy-MT2）**、**按站透明 HLS 缓存** 与 **自制播放器控制条** 于一体，无需云端 API、不上传任何视频帧。同时提供支持 **剧场全屏 + 一键 90° 横屏** 的 iOS Safari 用户脚本。
 
 [![Manifest V3](https://img.shields.io/badge/Manifest-V3-38bdf8?style=flat-square)](#)
 [![iOS Safari Userscript](https://img.shields.io/badge/iOS-Safari%20Userscript-a855f7?style=flat-square)](#ios-safari-安装与横屏全屏)

@@ -1,6 +1,6 @@
-# 交接文档 · web-video-beauty-mv3
+# 交接文档 · 沉浸式观影（web-video-beauty-mv3）
 
-> 最后更新：2026-11-24
+> 最后更新：2026-11-25
 > 项目路径：`E:\codex\2026-11-22\wo-x\work\web-video-beauty-mv3`
 > 平台：Windows / Chrome MV3 扩展 + Python FastAPI 本地服务
 
@@ -8,7 +8,7 @@
 
 ## 1. 这是什么
 
-一个给网页视频做**实时美颜** + **本地缓存** + **自带播放器回看**的 Chrome 扩展 + 本地服务。
+一个给网页视频做**实时美颜** + **离线中文字幕** + **本地缓存** + **自带播放器回看**的 Chrome 扩展 + 本地服务（对外扩展名：**沉浸式观影**）。
 
 三块能力：
 
@@ -47,6 +47,7 @@
 ✅ 推理分辨率       裁切模式下 448–512 边长（原先被硬压到 384），脸在推理图里 168–252px
 ✅ 本地媒体库       GET / 列出已缓存视频（缩略图/进度/删除/清理规则），离线兜底用
 ✅ 关键点预扫       已缓存 TS 离线 4fps 预扫（132 点位定长二进制 + 查表兜底，见 7.4）
+✅ 本地字幕         日/英 → 简体中文，按缓存边播边译、跳播优先、自动选档，见 7.5
 ```
 
 **服务当前状态**：正在 `127.0.0.1:8765` 运行（需手动启动）。
@@ -295,12 +296,21 @@ pip install -r requirements.txt          # fastapi uvicorn curl_cffi pydantic
 # ffmpeg：winget install Gyan.FFmpeg（config.py 会自动探测，缩略图也靠它）
 ```
 
-### 5.2 启动服务
+### 5.2 按需自动启动与手动启动服务
+
+**推荐（Windows 一键注册按需唤醒）**：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File cache-server/native-host/install-host.ps1
+```
+
+注册后，扩展会在用户实际启用「本站缓存」「本地字幕」或执行删除缓存时，通过 Native Messaging 自动在后台拉起 `cache-server`（无窗口）；30 分钟无真实业务活动且无进行中的转写/预扫任务时，服务端自动优雅退出。
+
+手动启动调试（如需前台看日志）：
 
 ```bash
 cd cache-server
 ./.venv/Scripts/python.exe main.py
-# 或后台：nohup python main.py > /tmp/rb.log 2>&1 &
 ```
 
 ### 5.3 用本地播放器（不装扩展也能看）
@@ -601,9 +611,15 @@ DELETE /api/library/{key} 删本地缓存
 | 浏览器 2 分钟 A/B 对照（0–120s，每 500ms 采样 240 次） | 基线（关 prescan）`face_mask`: **31.67%**（76/240）→ 开启后: **47.50%**（114/240），**相对 +50.0%** | `prescan.hits = 558`，`avgRenderFps`: **29.90 fps**（基线 29.18 fps） |
 | 客观 Canvas Diff（`t=57.935s` 远景小脸静止帧） | 差异像素 `11,924 / 921,600`（1.294%），**100.0% 落入人脸 ROI 内**，`diffBboxPx=[552,227,691,392]` | 左上角像素变化 = **0**，`maskCanvas` 左上角非零 = **0**，零多边形拖尾伪影 |
 
-### 7.5 其他待办
+### 7.5 本地字幕（日/英 → 中，已实现）
 
-- 服务开机自启（现在手动 `python main.py`）
+本地提交 `56faaf1` 新增了「本地字幕」和「字幕性能」。Whisper small 转写、混元 Hy-MT2 1.8B Q4 翻译。服务根据播放头和跳播位置处理已落盘的分片，结果保存在对应视频的缓存目录。性能自动档按本机能力和短测结果选择 CPU 兼容、CPU 多核或 Vulkan GPU 翻译。
+
+本地播放器已用一部 2 小时 2 分 51 秒的缓存实片试播和跳播。模型配置、接口、缓存格式、实测口径和待验收项见 [字幕翻译交接](HANDOVER-TRANSLATE.md)。
+
+### 7.6 其他待办
+
+- 服务按需自启与空闲自关已落地（Native Messaging `install-host.ps1` + 默认 30 分钟空闲自动退出；Linux/macOS 注册脚本待按需补）
 - 缓存管理 UI 增强（批量删、按大小排序、搜索）——基础版已有
 - 「合并为 mp4」按钮：现在缓存是 374 个散 TS 分片，想导出整片需要重新写 ffmpeg 合并（v3 那套已随代码删除）
 - `mode=all` 的分片失败容错
@@ -742,6 +758,10 @@ RB_CACHE_MAX_AGE_DAYS=7         # 超过这么多天没访问就删；0=不限
 RB_CACHE_MAX_GB=20              # 总量上限 GB，超了按最久没看删；0=不限
 RB_CACHE_SWEEP_INTERVAL_MIN=60  # 巡检间隔（分钟）
 RB_CACHE_SWEEP_FIRST_DELAY=45   # 启动后多久跑第一次（秒）
+
+# 空闲自动关闭（Native Messaging 按需拉起时由 native-host/env.json 传入）
+RB_IDLE_SHUTDOWN_MIN=30         # 无真实业务请求与后台任务后自动退出的分钟数；<=0 关闭
+RB_IDLE_CHECK_SEC=30            # 空闲巡检间隔（秒）
 ```
 
 前端开关（存 `chrome.storage.local`，不走环境变量）：
