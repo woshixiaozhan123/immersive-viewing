@@ -3,7 +3,7 @@
   "version": "1.1.0",
   "private": true,
   "type": "module",
-  "description": "实时美颜 — 本机离线实时网页视频美颜 Chromium MV3 扩展（WebGL + MediaPipe 478 点人脸追踪）。",
+  "description": "沉浸式观影 — 本机离线网页视频增强 Chromium MV3 扩展（26 项实时美颜 + 离线 AI 中文字幕 + 本地透明缓存 + 自制控制条）。",
   "license": "MIT",
   "engines": {
     "node": ">=18.0.0"

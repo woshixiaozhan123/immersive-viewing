@@ -10,6 +10,7 @@
 
   const setting = "rbSubsHosts";
   const profileSetting = "rbSubsProfile";
+  const styleSetting = "rbSubsStyle";
   const profiles = new Set(["auto", "cpu", "cpu-fast", "gpu"]);
   const session = crypto.randomUUID?.() || "rb-" + Date.now() + "-" + Math.random().toString(36).slice(2);
   const modes = new Set(["off", "zh", "both"]);
@@ -17,6 +18,7 @@
   let mode = "off";
   let profile = "auto";
   let activeProfile = null;
+  let subStyle = { fontScale: 1, offsetPct: 0 };
   let video = null;
   let mediaEvents = null;
   let timer = 0;
@@ -52,12 +54,36 @@
   function readSettings() {
     return new Promise((resolve) => {
       try {
-        storage.local.get({ [setting]: {}, [profileSetting]: "auto" }, (data) => {
+        storage.local.get({ [setting]: {}, [profileSetting]: "auto", [styleSetting]: { fontScale: 1, offsetPct: 0 } }, (data) => {
           if (runtime.lastError) resolve({});
           else resolve(data || {});
         });
       } catch (_) { resolve({}); }
     });
+  }
+
+  function normalizeStyle(raw) {
+    const fs = Number(raw?.fontScale);
+    const op = Number(raw?.offsetPct);
+    return {
+      fontScale: Number.isFinite(fs) ? Math.min(1.6, Math.max(0.7, Math.round(fs * 20) / 20)) : 1,
+      offsetPct: Number.isFinite(op) ? Math.min(35, Math.max(0, Math.round(op))) : 0,
+    };
+  }
+
+  function applyStyle(next) {
+    const normalized = normalizeStyle(next);
+    if (normalized.fontScale === subStyle.fontScale && normalized.offsetPct === subStyle.offsetPct) return;
+    subStyle = normalized;
+    render();
+    notify();
+  }
+
+  function setStyle(partial) {
+    applyStyle({ ...subStyle, ...(partial || {}) });
+    try {
+      storage.local.set({ [styleSetting]: subStyle });
+    } catch (_) {}
   }
 
   function setSettings(next) {
@@ -292,7 +318,18 @@
     const text = cue ? cue.zh || cue.src : "";
     const src = cue?.zh && mode === "both" ? cue.src : "";
     const recent = requestedAt !== null && Math.abs(point.time - requestedAt) < 5;
-    const messages = { queued: "正在生成字幕", uncached: "等待本地视频分片", offline: "请启动本地缓存服务", error: "字幕生成遇到问题" };
+    let uncachedMsg = "等待本地视频分片";
+    if (!local && state === "uncached") {
+      const relay = window.__RB_CACHE_RELAY__;
+      if (relay && typeof relay.isCacheEnabled === "function" && !relay.isCacheEnabled()) {
+        uncachedMsg = "请先开启「本站缓存」以生成字幕";
+      } else if (relay && typeof relay.isServerOnline === "function" && !relay.isServerOnline()) {
+        uncachedMsg = "正在连接本地缓存服务…";
+      } else if (relay && typeof relay.getRewrittenCount === "function" && relay.getRewrittenCount() === 0 && video.currentTime > 3) {
+        uncachedMsg = "未捕获到 HLS 分片（可能非 HLS 源或需刷新页面）";
+      }
+    }
+    const messages = { queued: "正在生成字幕", uncached: uncachedMsg, offline: "请启动本地缓存服务", error: "字幕生成遇到问题" };
     const hint = !text && recent && !video.ended ? messages[state] || "" : "";
     const full = document.fullscreenElement || document.webkitFullscreenElement;
     if (full === video || video.webkitDisplayingFullscreen) {
@@ -317,9 +354,11 @@
     frame.style.width = rect.width + "px";
     const trace = local ? document.getElementById("tracebar")?.getBoundingClientRect() : null;
     const controlInset = trace && trace.height ? rect.bottom - trace.top + 8 : 0;
-    const inset = Math.max(24, rect.height * 0.09, controlInset);
+    const extraLift = rect.height * (subStyle.offsetPct / 100);
+    const inset = Math.max(24, rect.height * 0.09, controlInset) + extraLift;
     frame.style.bottom = Math.max(0, innerHeight - rect.bottom + inset) + "px";
-    frame.style.setProperty("--rb-font", Math.max(15, Math.min(30, rect.height * 0.047)) + "px");
+    const fontPx = Math.round(Math.max(15, Math.min(30, rect.height * 0.047)) * subStyle.fontScale);
+    frame.style.setProperty("--rb-font", fontPx + "px");
     setText(primary, text);
     setText(secondary, src);
     setText(status, hint);
@@ -332,6 +371,8 @@
     profile: () => profile,
     activeProfile: () => activeProfile,
     setProfile,
+    style: () => ({ ...subStyle }),
+    setStyle,
     subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
   };
   document.addEventListener("fullscreenchange", render);
@@ -346,6 +387,7 @@
   storage?.onChanged?.addListener((changes, area) => {
     if (area !== "local") return;
     if (changes[profileSetting]) applyProfile(changes[profileSetting].newValue || "auto");
+    if (changes[styleSetting]) applyStyle(changes[styleSetting].newValue);
     if (changes[setting]) setSettings(changes[setting].newValue);
   });
   (async () => {
@@ -354,6 +396,7 @@
       if (context?.host) host = context.host;
     }
     const saved = await readSettings();
+    applyStyle(saved[styleSetting]);
     applyProfile(saved[profileSetting]);
     setSettings(saved[setting]);
   })();

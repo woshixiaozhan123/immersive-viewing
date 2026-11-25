@@ -757,16 +757,16 @@
 
     const wrap = document.createElement("div");
     wrap.innerHTML = `
-      <div class="fab hidden" id="fab" role="button" title="点击打开实时美颜面板，按住可拖拽">
+      <div class="fab hidden" id="fab" role="button" title="点击打开沉浸式观影面板，按住可拖拽">
         <span class="dot"></span>
-        <span id="fabText">美颜</span>
+        <span id="fabText">观影</span>
       </div>
 
       <div class="panel hidden" id="panel">
         <header class="header" id="panelHeader" title="按住标题栏可拖动面板位置">
           <div>
-            <h1>实时美颜</h1>
-            <p class="subtitle">26 项专业调参 · 悬浮球模式 · 478 点追踪</p>
+            <h1>沉浸式观影</h1>
+            <p class="subtitle">实时美颜 · 离线中文字幕 · 本地缓存</p>
           </div>
           <div class="hdr-right">
             <label class="switch" title="开启或关闭美颜">
@@ -814,8 +814,18 @@
               <option value="gpu">GPU 翻译</option>
             </select>
           </div>
+          <div id="subtitleStyleBox" style="display:none;margin-top:8px;padding-top:6px;border-top:1px dashed rgba(148,163,184,.2);gap:6px;flex-direction:column">
+            <div class="row-between" style="gap:8px">
+              <label class="hint-muted" for="subtitleFontScale" style="white-space:nowrap">字幕字号 <span id="subtitleFontScaleVal">100%</span></label>
+              <input id="subtitleFontScale" type="range" min="70" max="160" step="5" value="100" style="width:130px;accent-color:#f43f5e" />
+            </div>
+            <div class="row-between" style="gap:8px">
+              <label class="hint-muted" for="subtitleOffsetPct" style="white-space:nowrap">字幕高度 <span id="subtitleOffsetPctVal">+0%</span></label>
+              <input id="subtitleOffsetPct" type="range" min="0" max="35" step="1" value="0" style="width:130px;accent-color:#f43f5e" />
+            </div>
+          </div>
           <div class="row-between" id="cacheToggleRow" style="margin-top:9px">
-            <span class="label">本站缓存 <span id="cacheHostHint" class="hint-muted"></span></span>
+            <span class="label">本站缓存 <span id="cacheHostHint" class="hint-muted"></span> <button id="btnOpenLibrary" class="link-btn" type="button" style="margin-left:4px" title="打开本地媒体库查看已缓存视频与预扫人脸">媒体库↗</button></span>
             <label class="switch" title="把本站视频分片缓存到本地磁盘（按域名记忆）。关闭=完全不接管">
               <input type="checkbox" id="toggleSiteCache" />
               <span class="slider"></span>
@@ -1136,7 +1146,7 @@
       const showFab = !panelOpen && !fabHiddenByUser && hasVideos;
       els.fab.classList.toggle("hidden", !showFab);
       els.fab.classList.toggle("on", !!state.enabled);
-      els.fabText.textContent = state.enabled ? "美颜开" : "美颜";
+      els.fabText.textContent = state.enabled ? "观影·美颜" : "观影";
 
       if (!panelOpen) return;
 
@@ -1405,9 +1415,15 @@
       const subtitles = window.RBSubtitles;
       const profileControl = $("subtitleProfile");
       const profileHint = $("subtitleProfileHint");
+      const styleBox = $("subtitleStyleBox");
+      const fontScaleInput = $("subtitleFontScale");
+      const fontScaleVal = $("subtitleFontScaleVal");
+      const offsetInput = $("subtitleOffsetPct");
+      const offsetVal = $("subtitleOffsetPctVal");
       const names = { cpu: "CPU 兼容", "cpu-fast": "CPU 多核", gpu: "GPU 翻译" };
       const syncSubtitles = () => {
-        subtitleMode.value = subtitles.mode();
+        const curMode = subtitles.mode();
+        subtitleMode.value = curMode;
         profileControl.value = subtitles.profile();
         const active = subtitles.activeProfile();
         for (const option of profileControl.options) {
@@ -1415,14 +1431,69 @@
           else option.disabled = !active.available.includes(option.value);
         }
         profileHint.textContent = active ? names[active.effective] || "" : "";
+        if (styleBox && typeof subtitles.style === "function") {
+          styleBox.style.display = curMode === "off" ? "none" : "flex";
+          const st = subtitles.style();
+          const pctFont = Math.round((st.fontScale || 1) * 100);
+          const pctOffset = Math.round(st.offsetPct || 0);
+          if (fontScaleInput) fontScaleInput.value = String(pctFont);
+          if (fontScaleVal) fontScaleVal.textContent = `${pctFont}%`;
+          if (offsetInput) offsetInput.value = String(pctOffset);
+          if (offsetVal) offsetVal.textContent = `+${pctOffset}%`;
+        }
       };
       subtitleMode.disabled = false;
       profileControl.disabled = false;
       profileControl.addEventListener("change", () => subtitles.setProfile(profileControl.value));
+      if (fontScaleInput && typeof subtitles.setStyle === "function") {
+        fontScaleInput.addEventListener("input", () => {
+          const v = Number(fontScaleInput.value) || 100;
+          if (fontScaleVal) fontScaleVal.textContent = `${v}%`;
+          subtitles.setStyle({ fontScale: v / 100 });
+        });
+      }
+      if (offsetInput && typeof subtitles.setStyle === "function") {
+        offsetInput.addEventListener("input", () => {
+          const v = Number(offsetInput.value) || 0;
+          if (offsetVal) offsetVal.textContent = `+${v}%`;
+          subtitles.setStyle({ offsetPct: v });
+        });
+      }
       syncSubtitles();
       subtitles.subscribe(syncSubtitles);
       subtitleMode.addEventListener("change", () => {
         void subtitles.setMode(subtitleMode.value);
+      });
+    }
+
+    const btnOpenLibrary = $("btnOpenLibrary");
+    if (btnOpenLibrary) {
+      btnOpenLibrary.addEventListener("click", () => {
+        if (location.hostname === "127.0.0.1" && location.port === "8765") {
+          window.open("/", "_blank", "noopener");
+          return;
+        }
+        const openLib = () => window.open("http://127.0.0.1:8765/", "_blank", "noopener");
+        if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
+          btnOpenLibrary.disabled = true;
+          btnOpenLibrary.textContent = "启动中…";
+          try {
+            chrome.runtime.sendMessage(
+              { type: "rb-ensure-server", payload: { reason: "open-library" } },
+              () => {
+                void chrome.runtime.lastError;
+                btnOpenLibrary.disabled = false;
+                btnOpenLibrary.textContent = "媒体库↗";
+                openLib();
+              }
+            );
+            return;
+          } catch (_) {
+            btnOpenLibrary.disabled = false;
+            btnOpenLibrary.textContent = "媒体库↗";
+          }
+        }
+        openLib();
       });
     }
 
@@ -1484,10 +1555,34 @@
 
       sync();
 
+      let startingServer = false;
+
       cb.addEventListener("change", async () => {
+        const enabled = !!cb.checked;
         const map = await readMap();
-        map[host] = !!cb.checked;
+        map[host] = enabled;
         await writeMap(map);
+        if (enabled && els.cacheInfo) {
+          els.cacheInfo.style.display = "";
+          els.cacheInfo.textContent = "正在启动本地服务…";
+        }
+        if (enabled && typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
+          startingServer = true;
+          try {
+            chrome.runtime.sendMessage(
+              { type: "rb-ensure-server", payload: { reason: "panel-cache-toggle" } },
+              () => {
+                void chrome.runtime.lastError;
+                startingServer = false;
+                if (typeof window.__WVB_CACHE_SYNC__ === "function") {
+                  void window.__WVB_CACHE_SYNC__();
+                }
+              }
+            );
+          } catch (_) {
+            startingServer = false;
+          }
+        }
       });
 
       // 缓存状态 + 手动删除（能拿到本地服务才有意义）
@@ -1498,12 +1593,19 @@
         let flashTimer = 0;
         let lastInfo = null;
 
-        // 网页里靠 grab-hook 暴露的 safeKey；本地播放器页靠 player.html 暴露的 key
+        // 网页里优先拿 grab-hook（MAIN），拿不到时走同在 ISOLATED 的 grab-relay，本地页走 __RB_LOCAL_KEY__
         const curKey = () => {
           const dbg = window.__RB_HLS_DEBUG__;
           if (dbg && typeof dbg.getSafeKey === "function") {
             try {
               const k = dbg.getSafeKey();
+              if (k) return k;
+            } catch (_) {}
+          }
+          const relay = window.__RB_CACHE_RELAY__;
+          if (relay && typeof relay.getSafeKey === "function") {
+            try {
+              const k = relay.getSafeKey();
               if (k) return k;
             } catch (_) {}
           }
@@ -1647,10 +1749,10 @@
               hideAll();
               return;
             }
-            // 开关开着却没有 key：要么 hook 没注入（旧标签页），要么这站不是 HLS。
+            // 开关开着却没有 key：要么 relay/hook 没注入（旧标签页），要么这站不是 HLS。
             // 两种都明说，别让面板看起来"什么都没有"。
             showText(
-              window.__RB_HLS_DEBUG__
+              window.__RB_HLS_DEBUG__ || window.__RB_CACHE_RELAY__
                 ? "未识别到可缓存的视频源（本站可能不是 HLS 播放）"
                 : "缓存脚本未注入本页，刷新页面后生效"
             );
@@ -1662,7 +1764,7 @@
             d = await reqJSON(`${API}/api/video/${encodeURIComponent(sk)}`);
           } catch (_) {
             lastInfo = null;
-            showText("本地服务未启动，缓存不可用");
+            showText(startingServer ? "正在启动本地服务…" : "本地服务未启动，缓存不可用");
             hideActions();
             return;
           }
@@ -1672,7 +1774,7 @@
               hideAll();
               return;
             }
-            showText("本地还没有这条视频的分片");
+            showText("本地还没有这条视频的分片（播放后自动缓存）");
             await renderActions(null, sk);
             return;
           }

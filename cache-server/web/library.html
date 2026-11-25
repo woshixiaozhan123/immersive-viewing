@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>本地媒体库 · 实时美颜</title>
+<title>本地媒体库 · 沉浸式观影</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='%23ff4d8d'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/app.css">
 </head>
@@ -78,6 +78,7 @@
           <div class="pct">已缓存 ${it.cachedSegments} / ${it.totalSegments} 片 · ${pct}%</div>
           <div class="card-foot">
             <button class="btn primary" data-act="play" ${it.playable ? "" : "disabled"}>播放</button>
+            <button class="btn ghost" data-act="prescan" title="离线预扫人脸关键点，回看防掉妆" ${it.playable ? "" : "disabled"} data-done="${it.hasPrescan ? "1" : "0"}">${it.hasPrescan ? "已预扫 ✓" : "预扫人脸"}</button>
             <button class="btn icon danger" data-act="del" title="删除本地缓存">删除</button>
           </div>
         </div>
@@ -119,6 +120,60 @@
 
     if (act === "play") {
       location.href = `/play/${encodeURIComponent(key)}`;
+      return;
+    }
+
+    if (act === "prescan") {
+      const doneBefore = btn.dataset.done === "1";
+      if (doneBefore && !confirm("这条视频已完成关键点预扫，是否重新扫描？")) return;
+      btn.disabled = true;
+      btn.textContent = "启动中…";
+      const qs = doneBefore ? "?force=1" : "";
+      try {
+        const r = await fetch(`/api/prescan/${encodeURIComponent(key)}${qs}`, { method: "POST" });
+        if (r.status === 409) {
+          btn.textContent = "已有任务在跑";
+          setTimeout(() => {
+            btn.disabled = false;
+            btn.textContent = doneBefore ? "已预扫 ✓" : "预扫人脸";
+          }, 2000);
+          return;
+        }
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const poll = async () => {
+          try {
+            const sr = await fetch(`/api/prescan/${encodeURIComponent(key)}`, { cache: "no-store" });
+            const st = await sr.json();
+            if (st.state === "running") {
+              const exp = Number(st.expected) || 0;
+              const frm = Number(st.frames) || 0;
+              const pct = exp ? Math.min(99, Math.round((frm / exp) * 100)) : 0;
+              btn.textContent = exp ? `预扫 ${pct}%` : "预扫中…";
+              setTimeout(poll, 1500);
+              return;
+            }
+            if (st.state === "done" || st.exists) {
+              btn.dataset.done = "1";
+              btn.disabled = false;
+              btn.textContent = "已预扫 ✓";
+              return;
+            }
+            btn.disabled = false;
+            btn.textContent = "预扫失败";
+            setTimeout(() => {
+              btn.textContent = btn.dataset.done === "1" ? "已预扫 ✓" : "预扫人脸";
+            }, 2500);
+          } catch (_) {
+            btn.disabled = false;
+            btn.textContent = "预扫失败";
+          }
+        };
+        setTimeout(poll, 800);
+      } catch (_) {
+        btn.disabled = false;
+        btn.textContent = "启动失败";
+        setTimeout(() => { btn.textContent = doneBefore ? "已预扫 ✓" : "预扫人脸"; }, 2000);
+      }
       return;
     }
 
