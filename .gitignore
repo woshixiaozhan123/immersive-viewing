@@ -17,6 +17,10 @@ Thumbs.db
 .playwright-cli/
 
 # Runtime cache of the local player (thumbnails etc. live outside the repo, nothing here)
+cache-server/native-host/env.json
+cache-server/native-host/com.realtime_beauty.cache_host.json
+cache-server/native-host/launch.lock
+cache-server/native-host/profile-cache.json
 
 # Heavy MediaPipe binaries (fetched cleanly via `npm run setup` or bundled in GitHub Releases)
 vendor/mediapipe/vision_bundle.mjs

@@ -84,6 +84,12 @@ CACHE_SWEEP_INTERVAL_MIN: int = int(os.environ.get("RB_CACHE_SWEEP_INTERVAL_MIN"
 CACHE_SWEEP_FIRST_DELAY_SEC: int = int(os.environ.get("RB_CACHE_SWEEP_FIRST_DELAY", "45"))
 
 # ---------------------------------------------------------------------------
+# 空闲自动关闭（默认 30 分钟无真实业务活动且无后台任务时优雅退出；<=0 关闭）
+# ---------------------------------------------------------------------------
+IDLE_SHUTDOWN_MINUTES: float = float(os.environ.get("RB_IDLE_SHUTDOWN_MIN", "30"))
+IDLE_CHECK_INTERVAL_SEC: float = max(0.5, float(os.environ.get("RB_IDLE_CHECK_SEC", "30")))
+
+# ---------------------------------------------------------------------------
 # 离线人脸关键点预扫（HANDOVER-PRESCAN.md）
 # ---------------------------------------------------------------------------
 PRESCAN_FPS: int = max(1, int(os.environ.get("RB_PRESCAN_FPS", "4")))

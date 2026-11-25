@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "实时美颜",
+  "name": "沉浸式观影",
   "version": "1.1.0",
-  "description": "本机离线实时网页视频美颜扩展（MV3 悬浮球模式 + WebGL + MediaPipe 478 点人脸追踪），支持 26 项 Wink/剪映专业美肤、美型、美妆与画面调色、7 档预设与 Wink 中文配方解析。",
+  "description": "沉浸式观影 — 本机离线网页视频增强扩展，集 26 项 WebGL + MediaPipe 478 点实时美颜、本地 AI 离线中文字幕翻译、透明视频缓存与自制播放器控制条于一体。",
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
@@ -12,7 +12,8 @@
     "activeTab",
     "scripting",
     "storage",
-    "cookies"
+    "cookies",
+    "nativeMessaging"
   ],
   "host_permissions": [
     "http://127.0.0.1/*",
@@ -22,7 +23,7 @@
     "service_worker": "background/service-worker.js"
   },
   "action": {
-    "default_title": "实时美颜（点击展开/收起悬浮面板）",
+    "default_title": "沉浸式观影（点击展开/收起悬浮面板）",
     "default_icon": {
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",
